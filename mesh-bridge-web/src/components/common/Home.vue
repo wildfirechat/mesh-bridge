@@ -18,7 +18,7 @@
                 <el-menu-item>
                     <template #title>
                         <a
-                            href="https://docs.wildfirechat.cn/open"
+                            href="https://github.com/wildfirechat/mesh-bridge"
                             style="color: #303133; width: 100%"
                             target="_blank"
                         >开发文档</a>

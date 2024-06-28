@@ -5,7 +5,7 @@
                 <h2>IM域</h2>
                 <div style="display: flex; flex-direction: row; justify-content: space-between; align-items: center">
                     <p>开发文档请看
-                        <el-link href="https://docs.wildfirechat.cn/open" style="flex: 1" target="_blank" type="primary">开发文档</el-link>
+                        <el-link href="https://github.com/wildfirechat/mesh-bridge" style="flex: 1" target="_blank" type="primary">开发文档</el-link>
                     </p>
                     <el-button type="primary" @click="imDomainInfo = {}; createAppDialogVisible = true">添加 IM 域</el-button>
                 </div>
@@ -58,7 +58,7 @@
                         <el-input v-model.trim="imDomainInfo.name" autocomplete="off" placeholder="域名称"></el-input>
                     </el-form-item>
                     <el-form-item label="域ID" :label-width="formLabelWidth" prop="domainId">
-                        <el-input v-model.trim="imDomainInfo.domainId" autocomplete="off" placeholder="域的 ID，不能重复，类似 wildfirechat.cn"></el-input>
+                        <el-input disabled v-model.trim="imDomainInfo.domainId" autocomplete="off" placeholder="域的 ID，不能重复，类似 wildfirechat.cn"></el-input>
                     </el-form-item>
                     <el-form-item label="域描述" :label-width="formLabelWidth" prop="detailInfo">
                         <el-input v-model.trim="imDomainInfo.detailInfo" autocomplete="off" placeholder="域的一句话描述"></el-input>
@@ -125,13 +125,13 @@ const rules = {
         {min: 1, max: 20, message: '长度在 1 到 20 个字符', trigger: 'blur'}
     ],
     email: [
-        {required: true, message: '请输入邮箱地址', trigger: 'blur'},
+        {required: false, message: '请输入邮箱地址', trigger: 'blur'},
     ],
     tel: [
-        {required: true, message: '请输入电话号码', trigger: 'blur'},
+        {required: false, message: '请输入电话号码', trigger: 'blur'},
     ],
     address: [
-        {required: true, message: '请输入地址', trigger: 'blur'},
+        {required: false, message: '请输入地址', trigger: 'blur'},
     ],
     url: [
         {required: false, message: '请输入对方 IM Bridge 入访地址', trigger: 'blur'},

@@ -8,7 +8,7 @@
         >
         </el-avatar>
         <div>
-            <p class="title">{{ imDomain.domainId }}</p>
+            <p class="title">{{ imDomain.name}}</p>
             <p class="desc">{{ imDomain.detailInfo }}</p>
         </div>
     </div>
@@ -44,7 +44,7 @@ defineProps({
     height: 60px;
     display: flex;
     flex-direction: column;
-    justify-content: space-between;
+    justify-content: space-around;
 }
 
 .im-domain-card .title {

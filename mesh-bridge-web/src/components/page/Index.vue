@@ -120,7 +120,7 @@ const showIMDomainInfo = (imDomain) => {
 }
 
 const addIMDomain = () => {
-    router.replace('/dev/app')
+    router.replace('/dev/imdomain')
 }
 </script>
 
