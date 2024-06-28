@@ -5,6 +5,9 @@
 ## 环境依赖
 NodeJS 18.X
 
+## 开发调试
+修改`axios.config.js`文件里面的`baseUrl`配置，具体请参考注释
+
 ## 编译
 
 ```

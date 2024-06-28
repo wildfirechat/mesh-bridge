@@ -4,13 +4,13 @@ import global from "../global";
 
 // axios实例
 const instance = Axios.create({
-    // 针对实际情况进行修改
+    // 根据实际情况进行修改，否则将无法访问 mesh-bridge-server
     // 独立部署
     //baseURL: 'https://bridge.wildfirechat.cn/api',
-    // 打包到 server 项目
-    // baseURL: '/admin',
+    // 打包到 mesh-bridge-server 项目
+    baseURL: '/admin',
     // 开发调试
-    baseURL: 'http://localhost:8000/admin',
+    //baseURL: 'http://localhost:8000/admin',
     headers: {
         'Content-Type': 'application/json;charset=utf-8',
         Accept: 'application/json;charset=utf-8',
