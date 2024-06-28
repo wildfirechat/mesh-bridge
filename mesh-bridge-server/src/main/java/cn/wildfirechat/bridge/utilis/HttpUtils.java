@@ -8,9 +8,11 @@
 
 package cn.wildfirechat.bridge.utilis;
 
+import cn.wildfirechat.bridge.jpa.Domain;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import okhttp3.*;
+import org.apache.commons.codec.digest.DigestUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.util.StringUtils;
@@ -28,19 +30,39 @@ public class HttpUtils {
 
     public static final Map<String, OkHttpClient> httpClientMap = new ConcurrentHashMap<>();
 
+    private static String myDomainId;
+
+    public static void setMyDomainId(String myDomainId) {
+        HttpUtils.myDomainId = myDomainId;
+    }
+
     public interface HttpCallback {
         void onSuccess(String content);
         void onFailure(int statusCode, String errorMessage);
     }
 
-    public static void httpPost(final String url, String entityId, final Object object, final Headers headers, final HttpCallback httpCallback) {
+    private static Headers getSignHeaders(Domain domain) {
+        if(!StringUtils.hasText(myDomainId)) {
+            throw new RuntimeException("HttpUtils没有正确初始化，需要设置本方domainId");
+        }
+        int nonce = (int)(Math.random() * 100000 + 3);
+        long timestamp = System.currentTimeMillis();
+        String str = nonce + "|" + domain.secret + "|" + timestamp;
+        String sign = DigestUtils.sha1Hex(str);
+        Headers headers = new Headers.Builder().add("nonce", nonce+"").add("timestamp", ""+timestamp).add("sign", sign).add("x-domain-id", myDomainId +"").build();
+        return headers;
+    }
+
+    public static void httpPostToDomain(Domain domain, String path, final Object object, final HttpCallback httpCallback) {
         String jsonStr;
         if(object instanceof String) {
             jsonStr = (String) object;
         } else {
             jsonStr = gson.toJson(object);
         }
-        OkHttpClient httpClient = httpClientMap.computeIfAbsent(entityId, integer -> new OkHttpClient(new OkHttpClient.Builder().connectTimeout(Duration.ofSeconds(20))));
+        String url = domain.url + path;
+        Headers headers = getSignHeaders(domain);
+        OkHttpClient httpClient = httpClientMap.computeIfAbsent(domain.domainId, integer -> new OkHttpClient(new OkHttpClient.Builder().connectTimeout(Duration.ofSeconds(20))));
         httpCallbackJsonPost(url, jsonStr, headers, httpCallback, httpClient);
     }
 

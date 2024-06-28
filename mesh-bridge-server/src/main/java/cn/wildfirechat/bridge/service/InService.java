@@ -9,6 +9,7 @@ import cn.wildfirechat.pojos.*;
 import cn.wildfirechat.pojos.mesh.*;
 import cn.wildfirechat.sdk.MeshAdmin;
 import cn.wildfirechat.sdk.MessageAdmin;
+import cn.wildfirechat.sdk.RelationAdmin;
 import cn.wildfirechat.sdk.model.IMResult;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -74,6 +75,26 @@ public class InService {
             MeshRestResult restResult;
             try {
                 IMResult<Void> imResult = MeshAdmin.handleFriendRequest(fromUserId, targetUid, status);
+                if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
+                    restResult = MeshRestResult.ok();
+                } else {
+                    restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+            }
+            deferredResult.setResult(restResult.toString());
+        });
+        return deferredResult;
+    }
+
+    public Object onDeleteFriend(String domainId, String fromUserId, String friendUid) {
+        DeferredResult<String> deferredResult = new DeferredResult<>();
+        CompletableFuture.runAsync(()->{
+            MeshRestResult restResult;
+            try {
+                IMResult<Void> imResult = RelationAdmin.setUserFriend(fromUserId, friendUid, false, "");
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok();
                 } else {

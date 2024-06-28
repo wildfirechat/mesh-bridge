@@ -144,7 +144,6 @@ public class AdminService {
         if(TextUtils.isEmpty(domain.domainId)) {
             return AdminResult.error(ERROR_MISS_PARAMETER);
         }
-        domainRepository.save(domain);
         InputOutputDomainInfo domainInfo = new InputOutputDomainInfo();
         domainInfo.domainId = domain.domainId;
         domainInfo.name = domain.name;
@@ -157,6 +156,7 @@ public class AdminService {
         if(imResult.getErrorCode() != ErrorCode.ERROR_CODE_SUCCESS) {
             throw new Exception("Fail create domain in im server");
         }
+        domainRepository.save(domain);
         return AdminResult.ok();
     }
 

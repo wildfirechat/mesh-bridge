@@ -7,8 +7,6 @@ import cn.wildfirechat.pojos.*;
 import cn.wildfirechat.pojos.mesh.*;
 import cn.wildfirechat.sdk.utilities.JsonUtils;
 import com.google.gson.*;
-import okhttp3.Headers;
-import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.http.util.TextUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -16,6 +14,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import org.springframework.web.context.request.async.DeferredResult;
 
+import javax.annotation.PostConstruct;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
@@ -34,6 +33,11 @@ public class OutService {
 
     @Autowired
     DomainRepository domainRepository;
+
+    @PostConstruct
+    void init() {
+        HttpUtils.setMyDomainId(myDomainId);
+    }
 
     public Object onSearchUser(String domainId, String keyword, int searchType, int page) {
         if(!StringUtils.hasText(keyword)) {
@@ -56,8 +60,7 @@ public class OutService {
         req.searchType = searchType;
         req.page = page;
         req.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/search_user", domainId, req, headers, new HttpUtils.HttpCallback() {
+        HttpUtils.httpPostToDomain(domain, "/search_user", req, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<PojoSearchUserRes> meshRestResult = JsonUtils.fromJsonObject2(content, PojoSearchUserRes.class);
@@ -103,8 +106,8 @@ public class OutService {
         req.reason = reason;
         req.targetUserId = targetUid;
         req.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/add_friend_request", domainId, req, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/add_friend_request", req, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<Void> meshRestResult = JsonUtils.fromJsonObject2(content, Void.class);
@@ -144,8 +147,46 @@ public class OutService {
         req.status = status;
         req.targetUserId = targetUid;
         req.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/handle_friend_request", domainId, req, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/handle_friend_request", req, new HttpUtils.HttpCallback() {
+            @Override
+            public void onSuccess(String content) {
+                MeshRestResult<Void> meshRestResult = JsonUtils.fromJsonObject2(content, Void.class);
+                deferredResult.setResult(meshRestResult.toString());
+            }
+
+            @Override
+            public void onFailure(int statusCode, String errorMessage) {
+                MeshRestResult meshRestResult = MeshRestResult.localMeshError(ERROR_SERVER_ERROR.code, "Http request error:" + statusCode + ". message:" + errorMessage);
+                deferredResult.setResult(meshRestResult.toString());
+            }
+        });
+
+        return deferredResult;
+    }
+
+    public Object onDeleteFriend(String domainId, String fromUserId, String friendUid) {
+        if(!StringUtils.hasText(fromUserId) || !StringUtils.hasText(friendUid)) {
+            MeshRestResult meshRestResult = new MeshRestResult();
+            meshRestResult.addLocalMeshError(ERROR_INVALID_PARAMETER.code, ERROR_INVALID_PARAMETER.msg);
+            return meshRestResult.toString();
+        }
+
+        Optional<Domain> optionalDomain = domainRepository.findById(domainId);
+        if(!optionalDomain.isPresent()) {
+            MeshRestResult meshRestResult = new MeshRestResult();
+            meshRestResult.addLocalMeshError(ERROR_NOT_EXIST.code, "服务实体（" + domainId + ")不存在");
+            return meshRestResult.toString();
+        }
+        Domain domain = optionalDomain.get();
+
+        DeferredResult<String> deferredResult = new DeferredResult<>();
+        PojoDeleteFriend req = new PojoDeleteFriend();
+        req.operator = DomainIdUtils.toExternalId(domainId, fromUserId, myDomainId);
+        req.friendUid = DomainIdUtils.toExternalId(domainId, friendUid, myDomainId);;
+        req.domainId = myDomainId;
+
+        HttpUtils.httpPostToDomain(domain, "/delete_friend", req, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<Void> meshRestResult = JsonUtils.fromJsonObject2(content, Void.class);
@@ -186,8 +227,8 @@ public class OutService {
         req.messageData = messageData;
         req.clientId = sendClientId;
         req.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/send_message", domainId, req, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/send_message", req, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<SendMessageResult> meshRestResult = JsonUtils.fromJsonObject2(content, SendMessageResult.class);
@@ -351,8 +392,8 @@ public class OutService {
         req.domainId = myDomainId;
         req.republish = republish;
         req.messageId = messageId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/publish_message", domainId, req, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/publish_message", req, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<SendMessageResult> meshRestResult = JsonUtils.fromJsonObject2(content, SendMessageResult.class);
@@ -399,8 +440,8 @@ public class OutService {
                 req.messageId = optionalRemoteMessageId.get();
             }
         }
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/recall_message", domainId, req, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/recall_message", req, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<String> meshRestResult = JsonUtils.fromJsonObject2(content, String.class);
@@ -441,8 +482,8 @@ public class OutService {
         PojoStringList req = new PojoStringList();
         req.stringList = list;
         req.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/batch_user_infos", domainId, req, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/batch_user_infos", req, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<PojoSearchUserRes> meshRestResult = JsonUtils.fromJsonObject2(content, PojoSearchUserRes.class);
@@ -489,8 +530,8 @@ public class OutService {
         PojoStringList req = new PojoStringList();
         req.stringList = list;
         req.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/batch_group_infos", domainId, req, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/batch_group_infos", req, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<PojoGroupInfoList> meshRestResult = JsonUtils.fromJsonObject2(content, PojoGroupInfoList.class);
@@ -531,8 +572,8 @@ public class OutService {
         PojoString req = new PojoString();
         req.string = DomainIdUtils.toExternalId(domainId, groupId, myDomainId);
         req.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/get_group_member", domainId, req, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/get_group_member", req, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<OutputGroupMemberList> meshRestResult = JsonUtils.fromJsonObject2(content, OutputGroupMemberList.class);
@@ -578,8 +619,8 @@ public class OutService {
         for (PojoGroupMember member : members) {
             member.setMember_id(DomainIdUtils.toExternalId(domainId, member.getMember_id(), myDomainId));
         }
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/add_group_member", domainId, object, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/add_group_member", object, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<Void> meshRestResult = JsonUtils.fromJsonObject2(content, Void.class);
@@ -616,8 +657,8 @@ public class OutService {
         object.operator = DomainIdUtils.toExternalId(domainId, operator, myDomainId);
         object.group_id = DomainIdUtils.toExternalId(domainId, groupId, myDomainId);
         object.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/quit_group", domainId, object, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/quit_group", object, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<Void> meshRestResult = JsonUtils.fromJsonObject2(content, Void.class);
@@ -654,8 +695,8 @@ public class OutService {
         object.operator = DomainIdUtils.toExternalId(domainId, operator, myDomainId);
         object.group_id = DomainIdUtils.toExternalId(domainId, groupId, myDomainId);
         object.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/dismiss_group", domainId, object, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/dismiss_group", object, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<Void> meshRestResult = JsonUtils.fromJsonObject2(content, Void.class);
@@ -696,8 +737,8 @@ public class OutService {
         for (String member : members) {
             object.members.add(DomainIdUtils.toExternalId(domainId, member, myDomainId));
         }
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/kickoff_group_member", domainId, object, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/kickoff_group_member", object, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<Void> meshRestResult = JsonUtils.fromJsonObject2(content, Void.class);
@@ -735,8 +776,8 @@ public class OutService {
         object.newOwner = DomainIdUtils.toExternalId(domainId, newOwner, myDomainId);
         object.group_id = DomainIdUtils.toExternalId(domainId, groupId, myDomainId);
         object.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/transfer_group", domainId, object, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/transfer_group", object, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<Void> meshRestResult = JsonUtils.fromJsonObject2(content, Void.class);
@@ -775,8 +816,8 @@ public class OutService {
         object.type = type;
         object.value = value;
         object.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/modify_group_info", domainId, object, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/modify_group_info", object, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<Void> meshRestResult = JsonUtils.fromJsonObject2(content, Void.class);
@@ -833,8 +874,8 @@ public class OutService {
             object.domainIds = new ArrayList<>();
             object.domainIds.add(myDomainId);
 
-            Headers headers = getSignHeaders(domain);
-            HttpUtils.httpPost(domain.url + "/group_updated", domainId, object, headers, new HttpUtils.HttpCallback() {
+    
+            HttpUtils.httpPostToDomain(domain, "/group_updated", object, new HttpUtils.HttpCallback() {
                 @Override
                 public void onSuccess(String content) {
                     MeshRestResult<Void> meshRestResult = JsonUtils.fromJsonObject2(content, Void.class);
@@ -933,8 +974,8 @@ public class OutService {
         object.data = convertConferenceRequestDomainId(data, domainId, myDomainId);
         object.advanced = advanced;
         object.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/conference_request", domainId, object, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/conference_request", object, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<String> meshRestResult = JsonUtils.fromJsonObject2(content, String.class);
@@ -1010,8 +1051,8 @@ public class OutService {
         object.data = convertConferenceEventDomainId(data, domainId, myDomainId);
         object.isRobot = isRobot;
         object.domainId = myDomainId;
-        Headers headers = getSignHeaders(domain);
-        HttpUtils.httpPost(domain.url + "/conference_event", domainId, object, headers, new HttpUtils.HttpCallback() {
+
+        HttpUtils.httpPostToDomain(domain, "/conference_event", object, new HttpUtils.HttpCallback() {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<String> meshRestResult = JsonUtils.fromJsonObject2(content, String.class);
@@ -1100,14 +1141,5 @@ public class OutService {
         }
 
         return object.toString();
-    }
-
-    private Headers getSignHeaders(Domain domain) {
-        int nonce = (int)(Math.random() * 100000 + 3);
-        long timestamp = System.currentTimeMillis();
-        String str = nonce + "|" + domain.secret + "|" + timestamp;
-        String sign = DigestUtils.sha1Hex(str);
-        Headers headers = new Headers.Builder().add("nonce", nonce+"").add("timestamp", ""+timestamp).add("sign", sign).add("x-domain-id", myDomainId +"").build();
-        return headers;
     }
 }

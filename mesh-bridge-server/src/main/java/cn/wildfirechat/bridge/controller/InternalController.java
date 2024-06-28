@@ -35,6 +35,11 @@ public class InternalController {
         return outService.onHandleFriendRequest(handleFriendReq.domainId, handleFriendReq.userId, handleFriendReq.status, handleFriendReq.targetUserId);
     }
 
+    @PostMapping(value = "/delete_friend", produces = "application/json;charset=UTF-8")
+    public Object deleteFriend(@RequestBody PojoDeleteFriend deleteFriend) {
+        return outService.onDeleteFriend(deleteFriend.domainId, deleteFriend.operator, deleteFriend.friendUid);
+    }
+
     @PostMapping(value = "/send_message", produces = "application/json;charset=UTF-8")
     public Object sendMessage(@RequestBody PojoSendMessageReq sendMessageReq) {
         return outService.onSendMessageRequest(sendMessageReq.domainId, sendMessageReq.messageId, sendMessageReq.messageData, sendMessageReq.clientId);
