@@ -257,6 +257,13 @@ public class OutService {
         if(!TextUtils.isEmpty(messagePayload.getRemoteMediaUrl())) {
             //如果本域的对象存储服务无法让其他域的用户直接访问，这里需要把文件异步传输到其他域中，且这里修改一下文件的地址。需要新写传输文件的方法。
         }
+        if(!messagePayload.getMentionedTarget().isEmpty()) {
+            List<String> converted = new ArrayList<>();
+            for (String s : messagePayload.getMentionedTarget()) {
+                converted.add(DomainIdUtils.toExternalId(remoteDomainId, s, localDomainId));
+            }
+            messagePayload.setMentionedTarget(converted);
+        }
         if(messagePayload.getType() == 10) {
             messagePayload.setContent(DomainIdUtils.toExternalId(remoteDomainId, messagePayload.getContent(), localDomainId));
             String jsonStr = new String(Base64.getDecoder().decode(messagePayload.getBase64edData()), StandardCharsets.UTF_8);
