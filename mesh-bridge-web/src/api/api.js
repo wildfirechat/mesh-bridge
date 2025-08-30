@@ -32,6 +32,12 @@ export default {
         return axios.post('/delete_domain', {
             domainId
         })
+    },
+
+    pingDomain(domainId) {
+        return axios.post('/ping_domain', {
+            domainId
+        })
     }
 
 }

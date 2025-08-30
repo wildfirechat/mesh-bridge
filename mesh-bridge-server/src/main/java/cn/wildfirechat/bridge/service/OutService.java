@@ -39,7 +39,36 @@ public class OutService {
         HttpUtils.setMyDomainId(myDomainId);
     }
 
-    public Object onSearchUser(String domainId, String keyword, int searchType, int page) {
+    public Object onPing(String domainId) {
+        Optional<Domain> optionalDomain = domainRepository.findById(domainId);
+        if(!optionalDomain.isPresent()) {
+            MeshRestResult meshRestResult = new MeshRestResult();
+            meshRestResult.addLocalMeshError(ERROR_NOT_EXIST.code, "服务实体（" + domainId + ")不存在");
+            return meshRestResult.toString();
+        }
+        Domain domain = optionalDomain.get();
+
+        DeferredResult<String> deferredResult = new DeferredResult<>();
+        PojoDomainPingRequest request = new PojoDomainPingRequest();
+        request.domainId = myDomainId;
+        HttpUtils.httpPostToDomain(domain, "/ping", request, new HttpUtils.HttpCallback() {
+            @Override
+            public void onSuccess(String content) {
+                MeshRestResult<String> meshRestResult = JsonUtils.fromJsonObject2(content, String.class);
+                deferredResult.setResult(meshRestResult.toString());
+            }
+
+            @Override
+            public void onFailure(int statusCode, String errorMessage) {
+                MeshRestResult meshRestResult = MeshRestResult.localMeshError(ERROR_SERVER_ERROR.code, "Http访问对端不通，对端地址:" + domain.url + "，状态码:" + statusCode + ". message:" + errorMessage);
+                deferredResult.setResult(meshRestResult.toString());
+            }
+        });
+
+        return deferredResult;
+    }
+
+    public Object onSearchUser(String domainId, String keyword, int searchType, int userType, int page) {
         if(!StringUtils.hasText(keyword)) {
             MeshRestResult meshRestResult = new MeshRestResult();
             meshRestResult.addLocalMeshError(ERROR_INVALID_PARAMETER.code, ERROR_INVALID_PARAMETER.msg);
@@ -59,6 +88,7 @@ public class OutService {
         req.keyword = keyword;
         req.searchType = searchType;
         req.page = page;
+        req.userType = userType;
         req.domainId = myDomainId;
         HttpUtils.httpPostToDomain(domain, "/search_user", req, new HttpUtils.HttpCallback() {
             @Override

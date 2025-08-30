@@ -28,13 +28,33 @@ public class InService {
 
     @Autowired
     InMessageIdsRepository inMessageIdsRepository;
-    
-    public Object onSearchUser(String keyword, int searchType, int page) {
+
+    public Object onPing(String domainId) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
         CompletableFuture.runAsync(()->{
             MeshRestResult restResult;
             try {
-                IMResult<PojoSearchUserRes> imResult = MeshAdmin.searchUser(keyword, searchType, page);
+                IMResult<InputOutputDomainInfo> imResult = MeshAdmin.getDomain(domainId);
+                if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
+                    restResult = MeshRestResult.ok(imResult.result.name);
+                } else {
+                    restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+            }
+            deferredResult.setResult(restResult.toString());
+        });
+        return deferredResult;
+    }
+
+    public Object onSearchUser(String keyword, int searchType, int userType, int page) {
+        DeferredResult<String> deferredResult = new DeferredResult<>();
+        CompletableFuture.runAsync(()->{
+            MeshRestResult restResult;
+            try {
+                IMResult<PojoSearchUserRes> imResult = MeshAdmin.searchUser(keyword, searchType, userType, page);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {

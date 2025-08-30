@@ -9,6 +9,7 @@ import cn.wildfirechat.bridge.utilis.AdminResult;
 import cn.wildfirechat.pojos.InputOutputDomainInfo;
 import cn.wildfirechat.pojos.InputOutputUserInfo;
 import cn.wildfirechat.pojos.OutputApplicationUserInfo;
+import cn.wildfirechat.pojos.mesh.PojoDomainPingResponse;
 import cn.wildfirechat.sdk.MeshAdmin;
 import cn.wildfirechat.sdk.UserAdmin;
 import cn.wildfirechat.sdk.model.IMResult;
@@ -181,5 +182,24 @@ public class AdminService {
             list.add(domain);
         }
         return AdminResult.ok(list);
+    }
+
+    public Object pingDomain(String domainId) {
+        String result;
+        try {
+            IMResult<PojoDomainPingResponse> responseIMResult = MeshAdmin.pingDomain(domainId);
+            if(responseIMResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
+                if(responseIMResult.result.success) {
+                    result = "测试成功";
+                } else {
+                    result = "测试失败，错误信息：" + responseIMResult.getResult().errorMessage;
+                }
+            } else {
+                result = "测试失败，错误码：" + responseIMResult.getErrorCode();
+            }
+        } catch (Exception e) {
+            result = "请求到IM服务失败：" + e.getLocalizedMessage();
+        }
+        return AdminResult.ok(result);
     }
 }

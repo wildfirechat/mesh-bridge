@@ -43,10 +43,16 @@ export const useMeshBridgeStore = defineStore('meshBridge', {
                 })
         },
         deleteIMDomain(domainId) {
-            console.log('xxxo')
             api.deleteDomain(domainId)
                 .then(() => {
                     this.listIMDomain()
+                })
+        },
+        pingIMDomain(domainId) {
+            api.pingDomain(domainId)
+                .then(res => {
+                    console.log(res);
+                    alert(res);
                 })
         },
     },

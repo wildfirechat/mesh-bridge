@@ -19,9 +19,14 @@ public class ExternalController {
         return "Hello from external controller";
     }
 
+    @PostMapping(value = "/ping", produces = "application/json;charset=UTF-8")
+    public Object ping(@RequestBody PojoDomainPingRequest request) {
+        return inService.onPing(request.domainId);
+    }
+
     @PostMapping(value = "/search_user", produces = "application/json;charset=UTF-8")
     public Object searchUser(@RequestBody PojoSearchUserReq searchUserReq) {
-        return inService.onSearchUser(searchUserReq.keyword, searchUserReq.searchType, searchUserReq.page);
+        return inService.onSearchUser(searchUserReq.keyword, searchUserReq.searchType, searchUserReq.userType, searchUserReq.page);
     }
 
     @PostMapping(value = "/add_friend_request", produces = "application/json;charset=UTF-8")

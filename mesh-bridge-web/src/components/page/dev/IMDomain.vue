@@ -89,6 +89,7 @@
                     <el-button @click="modifyAppDialogVisible = false">取 消</el-button>
                     <el-button type="danger" @click="deleteDomain">删 除</el-button>
                     <el-button type="primary" @click="updateDomain('updateDomainForm')">修 改</el-button>
+                    <el-button @click="pingDomain">测试</el-button>
                 </div>
             </el-dialog>
         </el-main>
@@ -175,6 +176,10 @@ const updateDomain = (formName) => {
 const deleteDomain = () => {
     modifyAppDialogVisible.value = false;
     store.deleteIMDomain(imDomainInfo.value.domainId)
+}
+
+const pingDomain = () => {
+    store.pingIMDomain(imDomainInfo.value.domainId)
 }
 
 </script>

@@ -77,4 +77,9 @@ public class AdminController {
     public Object listDomain() {
         return adminService.listDomain();
     }
+
+    @PostMapping(value = "/ping_domain", produces = "application/json;charset=UTF-8")
+    public Object pingDomain(@RequestBody PojoDomainId domainId) throws Exception {
+        return adminService.pingDomain(domainId.domainId);
+    }
 }
