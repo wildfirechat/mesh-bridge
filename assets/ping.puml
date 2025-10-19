@@ -1,0 +1,12 @@
+@startuml
+  "A域管理页面" -> "A admin service" : 点击B域Ping按钮
+  "A admin service" -> "A IM server" : ping(B domainId)
+  "A IM server" -> "A internal service" : ping(B domainId)
+  "A internal service" -> "B external service" : ping(A domainId)
+  "B external service" -> "B IM server" : 获取A的域信息
+  "B external service" <- "B IM server" : 返回A的域信息
+  "A internal service" <- "B external service" : 返回成功
+  "A IM server" <- "A internal service" : 返回成功
+  "A admin service" <- "A IM server" : 返回成功
+  "A域管理页面" <- "A admin service" : 返回成功
+@enduml
