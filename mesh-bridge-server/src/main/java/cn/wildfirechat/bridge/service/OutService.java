@@ -25,6 +25,9 @@ public class OutService {
     @Value("${bridge.my_domain_id}")
     String myDomainId;
 
+    @Value("${bridge.domain_divider}")
+    String domainDivider;
+
     @Autowired
     OutMessageIdsRepository outMessageIdsRepository;
 
@@ -37,6 +40,7 @@ public class OutService {
     @PostConstruct
     void init() {
         HttpUtils.setMyDomainId(myDomainId);
+        DomainIdUtils.setDomainDivider(domainDivider);
     }
 
     public Object onPing(String domainId) {

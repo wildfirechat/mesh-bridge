@@ -1,6 +1,12 @@
 package cn.wildfirechat.bridge.utilis;
 
 public class DomainIdUtils {
+    private static String domainDivider = "@";
+
+    public static void setDomainDivider(String domainDivider) {
+        DomainIdUtils.domainDivider = domainDivider;
+    }
+
     //当请求对方时，需要转换ID。如果是带有域的ID：当域为对方域时，去掉域；当域非对方域时保留域。如果不带域，需要加上自己的域。
     //用在请求对方时。
     public static String toExternalId(String remoteDomainId, String targetId, String localDomainId) {
@@ -11,7 +17,7 @@ public class DomainIdUtils {
             }
             return targetId;
         } else {
-            return targetId + "@" + localDomainId;
+            return targetId + domainDivider + localDomainId;
         }
     }
 
@@ -25,24 +31,24 @@ public class DomainIdUtils {
             }
             return targetId;
         } else {
-            return targetId + "@" + remoteDomainId;
+            return targetId + domainDivider + remoteDomainId;
         }
     }
 
     private static boolean isExternalId(String targetId) {
-        if(targetId.contains("@")) {
+        if(targetId.contains(domainDivider)) {
             return true;
         }
         return false;
     }
 
     private static String getExternalId(String targetId) {
-        String[] ss = targetId.split("@");
+        String[] ss = targetId.split(domainDivider);
         return ss[1];
     }
 
     private static String getRawId(String targetId) {
-        String[] ss = targetId.split("@");
+        String[] ss = targetId.split(domainDivider);
         return ss[0];
     }
 }
