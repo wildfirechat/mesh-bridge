@@ -1,5 +1,6 @@
 package cn.wildfirechat.bridge.service;
 
+import cn.wildfirechat.bridge.controller.InternalController;
 import cn.wildfirechat.common.ErrorCode;
 import cn.wildfirechat.bridge.jpa.InMessageIds;
 import cn.wildfirechat.bridge.jpa.InMessageIdsKey;
@@ -10,7 +11,12 @@ import cn.wildfirechat.pojos.mesh.*;
 import cn.wildfirechat.sdk.MeshAdmin;
 import cn.wildfirechat.sdk.MessageAdmin;
 import cn.wildfirechat.sdk.RelationAdmin;
+import cn.wildfirechat.sdk.messagecontent.MessageContent;
+import cn.wildfirechat.sdk.messagecontent.MessageContentFactory;
+import cn.wildfirechat.sdk.messagecontent.TextMessageContent;
 import cn.wildfirechat.sdk.model.IMResult;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.context.request.async.DeferredResult;
@@ -23,6 +29,8 @@ import java.util.concurrent.CompletableFuture;
 
 @Service
 public class InService {
+    private static final Logger LOG = LoggerFactory.getLogger(InService.class);
+
     @Autowired
     OutMessageIdsRepository outMessageIdsRepository;
 
@@ -129,13 +137,19 @@ public class InService {
         return deferredResult;
     }
 
-    public Object onSendMessageRequest(String domainId, SendMessageData messageData, String sendClientId) {
+    public Object onSendMessageRequest(String domainId, long messageId, SendMessageData messageData, String sendClientId) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
         CompletableFuture.runAsync(()->{
             MeshRestResult restResult;
             try {
                 IMResult<SendMessageResult> imResult = MeshAdmin.sendMessage(messageData.getSender(), messageData.getConv(), messageData.getPayload(), null);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
+                    InMessageIdsKey key = new InMessageIdsKey(messageId, domainId);
+                    InMessageIds inMessageIds = new InMessageIds();
+                    inMessageIds.id = key;
+                    inMessageIds.localMessageId = imResult.getResult().getMessageUid();
+                    inMessageIdsRepository.save(inMessageIds);
+                    LOG.info("send in message success, from messageId {}, to messageId {}", messageId, imResult.getResult().getMessageUid());
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
@@ -212,6 +226,7 @@ public class InService {
                             inMessageIds.id = key;
                             inMessageIds.localMessageId = imResult.getResult().getMessageUid();
                             inMessageIdsRepository.save(inMessageIds);
+                            LOG.info("publish in message success, from messageId {}, to messageId {}", messageId, imResult.getResult().getMessageUid());
                         }
                     } else {
                         restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);

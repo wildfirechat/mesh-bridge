@@ -46,7 +46,7 @@ public class ExternalController {
 
     @PostMapping(value = "/send_message", produces = "application/json;charset=UTF-8")
     public Object sendMessage(@RequestBody PojoSendMessageReq sendMessageReq) {
-        return inService.onSendMessageRequest(sendMessageReq.domainId, sendMessageReq.messageData, sendMessageReq.clientId);
+        return inService.onSendMessageRequest(sendMessageReq.domainId, sendMessageReq.messageId, sendMessageReq.messageData, sendMessageReq.clientId);
     }
 
     @PostMapping(value = "/publish_message", produces = "application/json;charset=UTF-8")

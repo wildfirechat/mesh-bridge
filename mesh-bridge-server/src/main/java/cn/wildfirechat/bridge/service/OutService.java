@@ -5,9 +5,14 @@ import cn.wildfirechat.bridge.utilis.DomainIdUtils;
 import cn.wildfirechat.bridge.utilis.HttpUtils;
 import cn.wildfirechat.pojos.*;
 import cn.wildfirechat.pojos.mesh.*;
+import cn.wildfirechat.sdk.messagecontent.MessageContent;
+import cn.wildfirechat.sdk.messagecontent.MessageContentFactory;
+import cn.wildfirechat.sdk.messagecontent.TextMessageContent;
 import cn.wildfirechat.sdk.utilities.JsonUtils;
 import com.google.gson.*;
 import org.apache.http.util.TextUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -22,6 +27,8 @@ import static cn.wildfirechat.pojos.mesh.MeshRestResult.MeshRestCode.*;
 
 @Service
 public class OutService {
+    private static final Logger LOG = LoggerFactory.getLogger(OutService.class);
+
     @Value("${bridge.my_domain_id}")
     String myDomainId;
 
@@ -261,6 +268,7 @@ public class OutService {
         req.messageData = messageData;
         req.clientId = sendClientId;
         req.domainId = myDomainId;
+        req.messageId = messageId;
 
         HttpUtils.httpPostToDomain(domain, "/send_message", req, new HttpUtils.HttpCallback() {
             @Override
@@ -272,6 +280,7 @@ public class OutService {
                     outMessageIds.toDomainId = domainId;
                     outMessageIds.toMessageId = meshRestResult.getResult().getMessageUid();
                     outMessageIdsRepository.save(outMessageIds);
+                    LOG.info("send out message success, from messageId {}, to messageId {}", messageId, meshRestResult.getResult().getMessageUid());
                 }
 
                 deferredResult.setResult(meshRestResult.toString());
@@ -287,10 +296,37 @@ public class OutService {
         return deferredResult;
     }
 
+    private long convertMessageUid(String sender, long messageUid) {
+        // 根据发送者能够确定是本域发送的还是其他域发送的。再根据记录找到消息的对应关系，替换为对应域的消息ID
+        if(DomainIdUtils.isExternalId(sender)) {
+            //收到的消息
+            String senderDomainId = DomainIdUtils.getExternalId(sender);
+            Optional<Long> optionalOutMessageIds = inMessageIdsRepository.findByDomainIdAndLocalMessageId(senderDomainId, messageUid);
+            if(optionalOutMessageIds.isPresent()) {
+                return optionalOutMessageIds.get();
+            } else {
+                LOG.error("Convert message uid {} failed. The message is from {} domain", messageUid, senderDomainId);
+                return 0;
+            }
+        } else {
+            //发出去的消息
+            Optional<OutMessageIds> optionalOutMessageIds = outMessageIdsRepository.findById(messageUid);
+            if(optionalOutMessageIds.isPresent()) {
+                return optionalOutMessageIds.get().getToMessageId();
+            } else {
+                LOG.error("Convert message uid {} failed. The message is from local domain", messageUid);
+                return 0;
+            }
+        }
+    }
+
+    //这里是出去的消息进行转换的地方，消息中包含的用户ID/群组ID/频道ID和消息ID等需要转换为对方视角的ID。
+    //理论上所有二开只能局限于这个函数。如果有其他改动容易出问题。如果其他地方需要改动，请给我们提PR或者联系我们修改，确保其他部分保持一致。
     private void convertMessagePayloadDomainId(String remoteDomainId, MessagePayload messagePayload, String localDomainId) {
         if(!TextUtils.isEmpty(messagePayload.getRemoteMediaUrl())) {
             //如果本域的对象存储服务无法让其他域的用户直接访问，这里需要把文件异步传输到其他域中，且这里修改一下文件的地址。需要新写传输文件的方法。
         }
+
         if(!messagePayload.getMentionedTarget().isEmpty()) {
             List<String> converted = new ArrayList<>();
             for (String s : messagePayload.getMentionedTarget()) {
@@ -298,7 +334,26 @@ public class OutService {
             }
             messagePayload.setMentionedTarget(converted);
         }
-        if(messagePayload.getType() == 10) {
+
+        if(messagePayload.getType() == 1) {
+            MessageContent msgContent = MessageContentFactory.decodeMessageContent(messagePayload);
+            if(msgContent instanceof TextMessageContent) {
+                TextMessageContent txtContent = (TextMessageContent) msgContent;
+                if(txtContent.getQuoteInfo() != null && txtContent.getQuoteInfo().getMessageUid() > 0) {
+                    // 文本消息，有可能有引用，引用信息中包含消息ID，这个消息ID在每个域中都是不同的。也包含发送者用户ID。
+
+                    // 替换消息ID
+                    long targetMessageUid = convertMessageUid(txtContent.getQuoteInfo().getUserId(), txtContent.getQuoteInfo().getMessageUid());
+                    txtContent.getQuoteInfo().setMessageUid(targetMessageUid);
+
+                    // 发送者转换域地址。
+                    txtContent.getQuoteInfo().setUserId(DomainIdUtils.toExternalId(remoteDomainId, txtContent.getQuoteInfo().getUserId(), myDomainId));
+
+                    //设置到payload中
+                    messagePayload.setBase64edData(Base64.getEncoder().encodeToString(txtContent.getQuoteInfo().encode().toJSONString().getBytes(StandardCharsets.UTF_8)));
+                }
+            }
+        } else if(messagePayload.getType() == 10) {
             messagePayload.setContent(DomainIdUtils.toExternalId(remoteDomainId, messagePayload.getContent(), localDomainId));
             String jsonStr = new String(Base64.getDecoder().decode(messagePayload.getBase64edData()), StandardCharsets.UTF_8);
             JsonObject object = (JsonObject) JsonParser.parseString(jsonStr);
@@ -331,16 +386,41 @@ public class OutService {
             messagePayload.setContent(DomainIdUtils.toExternalId(remoteDomainId, messagePayload.getContent(), localDomainId));
         }
 
-        if(messagePayload.getType() == 80) {
-            messagePayload.setContent(DomainIdUtils.toExternalId(remoteDomainId, messagePayload.getContent(), localDomainId));
-            if(TextUtils.isEmpty(messagePayload.getExtra())) {
+        //撤回或者删除消息
+        if(messagePayload.getType() == 80 || messagePayload.getType() == 81) {
+            String operatorId = messagePayload.getContent();
+            String originalSender = operatorId;
+            long messageUid = Long.parseLong(new String(Base64.getDecoder().decode(messagePayload.getBase64edData())));
+            boolean isRealSender = false;
+            if(!TextUtils.isEmpty(messagePayload.getExtra())) {
                 JsonObject object = (JsonObject) JsonParser.parseString(messagePayload.getExtra());
                 if(object != null) {
+                    String sender = object.get("s").getAsString();
+                    if(!StringUtils.isEmpty(sender)) {
+                        originalSender = sender;
+                        isRealSender = true;
+                    }
                     replaceString(object, "s", remoteDomainId, localDomainId);
                     messagePayload.setExtra(object.toString());
                 }
             }
+
+            // 文本消息，有可能有引用，引用信息中包含消息ID，这个消息ID在每个域中都是不同的。也包含发送者用户ID。
+
+            // 替换消息ID
+            if(!isRealSender) {
+                //需要用发送者的域信息来确定消息来源。删除消息在2025.12.1之前的版本不带原消息发送者的，只能猜测operatorId跟sender一个域。
+                //有可能不是同一个域，导致错误。比一个域中的群中，有另外一个域的用户发送消息，群所在域可以用server api删除这个消息。
+                //当出现这种情况时，需要升级IM服务，让删除消息带上发送者信息.
+                LOG.error("撤回或删除消息内容，消息体中没有找到发送者。如果消息是对方域用户发送，删除将失败！");
+            }
+            long targetMessageUid = convertMessageUid(originalSender, messageUid);
+            messagePayload.setBase64edData(Base64.getEncoder().encodeToString(String.valueOf(targetMessageUid).getBytes(StandardCharsets.UTF_8)));
+
+            //替换操作者
+            messagePayload.setContent(DomainIdUtils.toExternalId(remoteDomainId, messagePayload.getContent(), localDomainId));
         }
+
         if(messagePayload.getType() >= 104 && messagePayload.getType() <= 124) {
             String jsonStr = new String(Base64.getDecoder().decode(messagePayload.getBase64edData()), StandardCharsets.UTF_8);
             JsonObject object = (JsonObject) JsonParser.parseString(jsonStr);
@@ -438,6 +518,13 @@ public class OutService {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<SendMessageResult> meshRestResult = JsonUtils.fromJsonObject2(content, SendMessageResult.class);
+
+                OutMessageIds outMessageIds = new OutMessageIds();
+                outMessageIds.messageId = messageId;
+                outMessageIds.toDomainId = domainId;
+                outMessageIds.toMessageId = meshRestResult.getResult().getMessageUid();
+                outMessageIdsRepository.save(outMessageIds);
+                LOG.info("publish out message success, local messageId {}, remote messageId {}", messageId, meshRestResult.getResult().getMessageUid());
                 deferredResult.setResult(meshRestResult.toString());
             }
 

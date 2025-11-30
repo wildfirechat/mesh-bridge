@@ -35,14 +35,14 @@ public class DomainIdUtils {
         }
     }
 
-    private static boolean isExternalId(String targetId) {
+    public static boolean isExternalId(String targetId) {
         if(targetId.contains(domainDivider)) {
             return true;
         }
         return false;
     }
 
-    private static String getExternalId(String targetId) {
+    public static String getExternalId(String targetId) {
         String[] ss = targetId.split(domainDivider);
         return ss[1];
     }

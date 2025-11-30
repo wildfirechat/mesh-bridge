@@ -3,10 +3,11 @@ package cn.wildfirechat.bridge.jpa;
 
 import javax.persistence.EmbeddedId;
 import javax.persistence.Entity;
+import javax.persistence.Index;
 import javax.persistence.Table;
 
 @Entity
-@Table(name = "in_message_ids")
+@Table(name = "in_message_ids", indexes = {@Index(name = "idx_domain_local_msg", columnList = "domainId, localMessageId")})
 public class InMessageIds {
     @EmbeddedId
     public InMessageIdsKey id;
