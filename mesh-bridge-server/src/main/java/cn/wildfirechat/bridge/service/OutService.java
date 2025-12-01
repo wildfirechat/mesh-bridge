@@ -274,16 +274,19 @@ public class OutService {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<SendMessageResult> meshRestResult = JsonUtils.fromJsonObject2(content, SendMessageResult.class);
-                if((messageData.getPayload().getPersistFlag() & 0x01) > 0) {
-                    OutMessageIds outMessageIds = new OutMessageIds();
-                    outMessageIds.messageId = messageId;
-                    outMessageIds.toDomainId = domainId;
-                    outMessageIds.toMessageId = meshRestResult.getResult().getMessageUid();
-                    outMessageIdsRepository.save(outMessageIds);
-                    LOG.info("send out message success, from messageId {}, to messageId {}", messageId, meshRestResult.getResult().getMessageUid());
+                if(meshRestResult.getLocal_mesh_code() == 0 && meshRestResult.getRemote_mesh_code() == 0 && meshRestResult.getRemote_im_code() == 0) {
+                    if ((messageData.getPayload().getPersistFlag() & 0x01) > 0) {
+                        OutMessageIds outMessageIds = new OutMessageIds();
+                        outMessageIds.messageId = messageId;
+                        outMessageIds.toDomainId = domainId;
+                        outMessageIds.toMessageId = meshRestResult.getResult().getMessageUid();
+                        outMessageIdsRepository.save(outMessageIds);
+                        LOG.info("send out message success, from messageId {}, to messageId {}", messageId, meshRestResult.getResult().getMessageUid());
+                    }
+                } else {
+                    LOG.error("send out message failure! result: {}", content);
                 }
-
-                deferredResult.setResult(meshRestResult.toString());
+                deferredResult.setResult(content);
             }
 
             @Override
@@ -518,14 +521,18 @@ public class OutService {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<SendMessageResult> meshRestResult = JsonUtils.fromJsonObject2(content, SendMessageResult.class);
+                if(meshRestResult.getLocal_mesh_code() == 0 && meshRestResult.getRemote_mesh_code() == 0 && meshRestResult.getRemote_im_code() == 0) {
+                    OutMessageIds outMessageIds = new OutMessageIds();
+                    outMessageIds.messageId = messageId;
+                    outMessageIds.toDomainId = domainId;
+                    outMessageIds.toMessageId = meshRestResult.getResult().getMessageUid();
+                    outMessageIdsRepository.save(outMessageIds);
+                    LOG.info("publish out message success, local messageId {}, remote messageId {}", messageId, meshRestResult.getResult().getMessageUid());
+                } else {
+                    LOG.error("publish out message failure! result is {}", content);
+                }
 
-                OutMessageIds outMessageIds = new OutMessageIds();
-                outMessageIds.messageId = messageId;
-                outMessageIds.toDomainId = domainId;
-                outMessageIds.toMessageId = meshRestResult.getResult().getMessageUid();
-                outMessageIdsRepository.save(outMessageIds);
-                LOG.info("publish out message success, local messageId {}, remote messageId {}", messageId, meshRestResult.getResult().getMessageUid());
-                deferredResult.setResult(meshRestResult.toString());
+                deferredResult.setResult(content);
             }
 
             @Override
