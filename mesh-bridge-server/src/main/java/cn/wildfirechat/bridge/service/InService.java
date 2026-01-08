@@ -142,7 +142,7 @@ public class InService {
         CompletableFuture.runAsync(()->{
             MeshRestResult restResult;
             try {
-                IMResult<SendMessageResult> imResult = MeshAdmin.sendMessage(messageData.getSender(), messageData.getConv(), messageData.getPayload(), null);
+                IMResult<SendMessageResult> imResult = MeshAdmin.sendMessage(messageData.getSender(), messageData.getConv(), messageData.getPayload(), messageData.getToUsers());
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     InMessageIdsKey key = new InMessageIdsKey(messageId, domainId);
                     InMessageIds inMessageIds = new InMessageIds();
