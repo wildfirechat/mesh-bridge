@@ -193,23 +193,14 @@ public class InService {
 
                     Optional<Long> outMessageIdOptional = outMessageIdsRepository.findByDomainIdAndToMessageId(domainId, messageId);
                     if(outMessageIdOptional.isPresent()) {
-                        if(inExist) {
-                            IMResult<Void> imResult = MessageAdmin.deleteMessage(outMessageIdOptional.get());
-                            if (imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
-
-                            } else {
-                                restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
-                            }
+                        IMResult<Void> imResult = MeshAdmin.updateMessageContent(messageData.getSender(), outMessageIdOptional.get(), messageData.getPayload(), true);
+                        if (imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
+                            SendMessageResult sendMessageResult = new SendMessageResult();
+                            sendMessageResult.setMessageUid(outMessageIdOptional.get());
+                            sendMessageResult.setTimestamp(System.currentTimeMillis());
+                            restResult = MeshRestResult.ok(sendMessageResult);
                         } else {
-                            IMResult<Void> imResult = MeshAdmin.updateMessageContent(messageData.getSender(), outMessageIdOptional.get(), messageData.getPayload(), true);
-                            if (imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
-                                SendMessageResult sendMessageResult = new SendMessageResult();
-                                sendMessageResult.setMessageUid(outMessageIdOptional.get());
-                                sendMessageResult.setTimestamp(System.currentTimeMillis());
-                                restResult = MeshRestResult.ok(sendMessageResult);
-                            } else {
-                                restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
-                            }
+                            restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                         }
                     } else {
                         if(!inExist) {
@@ -217,7 +208,8 @@ public class InService {
                         }
                     }
                 } else {
-                    IMResult<SendMessageResult> imResult = MeshAdmin.publishMessage(messageData, receivers);
+                    Optional<Long> outMessageIdOptional = outMessageIdsRepository.findByDomainIdAndToMessageId(domainId, messageId);
+                    IMResult<SendMessageResult> imResult = MeshAdmin.publishMessage(messageData, receivers, outMessageIdOptional.isPresent()?outMessageIdOptional.get():0);
                     if (imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                         restResult = MeshRestResult.ok(imResult.result);
                         if ((messageData.getPayload().getPersistFlag() & 0x01) > 0) {

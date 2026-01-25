@@ -360,7 +360,7 @@ public class OutService {
             messagePayload.setContent(DomainIdUtils.toExternalId(remoteDomainId, messagePayload.getContent(), localDomainId));
             String jsonStr = new String(Base64.getDecoder().decode(messagePayload.getBase64edData()), StandardCharsets.UTF_8);
             JsonObject object = (JsonObject) JsonParser.parseString(jsonStr);
-            if(replaceString(object, "f", remoteDomainId, localDomainId)) {
+            if(replaceOutString(object, "f", remoteDomainId, localDomainId)) {
                 messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
             }
         } else if(messagePayload.getType() == 400) {
@@ -372,7 +372,7 @@ public class OutService {
         } else if(messagePayload.getType() == 406) {
             String jsonStr = new String(Base64.getDecoder().decode(messagePayload.getBase64edData()), StandardCharsets.UTF_8);
             JsonObject object = (JsonObject) JsonParser.parseString(jsonStr);
-            replaceString(object, "initiator", remoteDomainId, localDomainId);
+            replaceOutString(object, "initiator", remoteDomainId, localDomainId);
             replaceStringList(object, "participants", remoteDomainId, localDomainId);
             if(object.has("existParticipants") && object.get("existParticipants") instanceof JsonArray) {
                 JsonArray existParticipants = (JsonArray) object.get("existParticipants");
@@ -403,7 +403,7 @@ public class OutService {
                         originalSender = sender;
                         isRealSender = true;
                     }
-                    replaceString(object, "s", remoteDomainId, localDomainId);
+                    replaceOutString(object, "s", remoteDomainId, localDomainId);
                     messagePayload.setExtra(object.toString());
                 }
             }
@@ -427,8 +427,8 @@ public class OutService {
         if(messagePayload.getType() >= 104 && messagePayload.getType() <= 124) {
             String jsonStr = new String(Base64.getDecoder().decode(messagePayload.getBase64edData()), StandardCharsets.UTF_8);
             JsonObject object = (JsonObject) JsonParser.parseString(jsonStr);
-            replaceString(object, "o", remoteDomainId, localDomainId);
-            replaceString(object, "g", remoteDomainId, localDomainId);
+            replaceOutString(object, "o", remoteDomainId, localDomainId);
+            replaceOutString(object, "g", remoteDomainId, localDomainId);
             switch (messagePayload.getType()) {
                 case 105:  //add group member
                 case 106:  //kickoff group member
@@ -441,7 +441,7 @@ public class OutService {
                 case 109:  //transfer group
                 case 111:  //change group member alias
                 case 123:  //change group member extra
-                    replaceString(object, "m", remoteDomainId, localDomainId);
+                    replaceOutString(object, "m", remoteDomainId, localDomainId);
                     break;
                 case 104:  //create group
                 case 107:  //quit group
@@ -462,10 +462,20 @@ public class OutService {
         }
     }
 
-    private boolean replaceString(JsonObject object, String key, String remoteDomainId, String localDomainId) {
+    private boolean replaceOutString(JsonObject object, String key, String remoteDomainId, String localDomainId) {
         if(object.has(key) && object.get(key) instanceof JsonPrimitive) {
             String o = object.get(key).getAsString();
             o = DomainIdUtils.toExternalId(remoteDomainId, o, localDomainId);
+            object.addProperty(key, o);
+            return true;
+        }
+        return false;
+    }
+
+    private boolean replaceInString(JsonObject object, String key, String remoteDomainId, String localDomainId) {
+        if(object.has(key) && object.get(key) instanceof JsonPrimitive) {
+            String o = object.get(key).getAsString();
+            o = DomainIdUtils.toInternalId(remoteDomainId, o, localDomainId);
             object.addProperty(key, o);
             return true;
         }
@@ -580,6 +590,17 @@ public class OutService {
             @Override
             public void onSuccess(String content) {
                 MeshRestResult<String> meshRestResult = JsonUtils.fromJsonObject2(content, String.class);
+                if(!TextUtils.isEmpty(meshRestResult.getResult())) {
+                    try {
+                        JsonObject object = (JsonObject) JsonParser.parseString(meshRestResult.getResult());
+                        if(object != null) {
+                            replaceInString(object, "s", domainId, myDomainId);
+                            meshRestResult.setResult(object.toString());
+                        }
+                    } catch (JsonSyntaxException e) {
+                        e.printStackTrace();
+                    }
+                }
                 deferredResult.setResult(meshRestResult.toString());
             }
 
