@@ -793,6 +793,50 @@ public class OutService {
         return deferredResult;
     }
 
+    public Object addJoinGroupRequest(String domainId, String operator, String groupId, List<String> userIds, String reason, String extra) {
+        if(!StringUtils.hasText(groupId) || userIds.isEmpty()) {
+            MeshRestResult meshRestResult = new MeshRestResult();
+            meshRestResult.addLocalMeshError(ERROR_INVALID_PARAMETER.code, ERROR_INVALID_PARAMETER.msg);
+            return meshRestResult.toString();
+        }
+
+        Optional<Domain> optionalDomain = domainRepository.findById(domainId);
+        if(!optionalDomain.isPresent()) {
+            MeshRestResult meshRestResult = new MeshRestResult();
+            meshRestResult.addLocalMeshError(ERROR_NOT_EXIST.code, "服务实体（" + domainId + ")不存在");
+            return meshRestResult.toString();
+        }
+        Domain domain = optionalDomain.get();
+
+        DeferredResult<String> deferredResult = new DeferredResult<>();
+        PojoAddJoinGroupRequest object = new PojoAddJoinGroupRequest();
+        object.operator = DomainIdUtils.toExternalId(domainId, operator, myDomainId);
+        object.group_id = DomainIdUtils.toExternalId(domainId, groupId, myDomainId);
+        object.domainId = myDomainId;
+        object.reason = reason;
+        object.extra = extra;
+        object.userIds = new ArrayList<>();
+        for (String member : userIds) {
+            object.userIds.add(DomainIdUtils.toExternalId(domainId, member, myDomainId));
+        }
+
+        HttpUtils.httpPostToDomain(domain, "/add_join_group_request", object, new HttpUtils.HttpCallback() {
+            @Override
+            public void onSuccess(String content) {
+                MeshRestResult<Void> meshRestResult = JsonUtils.fromJsonObject2(content, Void.class);
+                deferredResult.setResult(meshRestResult.toString());
+            }
+
+            @Override
+            public void onFailure(int statusCode, String errorMessage) {
+                MeshRestResult meshRestResult = MeshRestResult.localMeshError(ERROR_SERVER_ERROR.code, "Http request error:" + statusCode + ". message:" + errorMessage);
+                deferredResult.setResult(meshRestResult.toString());
+            }
+        });
+
+        return deferredResult;
+    }
+
     public Object quitGroupRequest(String domainId, String operator, String groupId) {
         if(!StringUtils.hasText(groupId) || !StringUtils.hasText(operator)) {
             MeshRestResult meshRestResult = new MeshRestResult();

@@ -79,6 +79,11 @@ public class ExternalController {
         return inService.addGroupMemberRequest(pojoAddGroupMember.domainId, pojoAddGroupMember.operator, pojoAddGroupMember.group_id, pojoAddGroupMember.members);
     }
 
+    @PostMapping(value = "/add_join_group_request", produces = "application/json;charset=UTF-8")
+    public Object addJoinGroupRequest(@RequestBody PojoAddJoinGroupRequest pojoAddJoinGroupRequest) {
+        return inService.addJoinGroupRequest(pojoAddJoinGroupRequest.domainId, pojoAddJoinGroupRequest.operator, pojoAddJoinGroupRequest.group_id, pojoAddJoinGroupRequest.userIds, pojoAddJoinGroupRequest.reason, pojoAddJoinGroupRequest.extra);
+    }
+
     @PostMapping(value = "/quit_group", produces = "application/json;charset=UTF-8")
     public Object quitGroupRequest(@RequestBody PojoQuitGroup pojoQuitGroup) {
         return inService.quitGroupRequest(pojoQuitGroup.domainId, pojoQuitGroup.operator, pojoQuitGroup.group_id);

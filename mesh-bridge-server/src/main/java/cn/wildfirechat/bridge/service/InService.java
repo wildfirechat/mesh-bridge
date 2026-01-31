@@ -334,6 +334,26 @@ public class InService {
         return deferredResult;
     }
 
+    public Object addJoinGroupRequest(String domainId, String operator, String groupId, List<String> userIds, String reason, String extra) {
+        DeferredResult<String> deferredResult = new DeferredResult<>();
+        CompletableFuture.runAsync(()->{
+            MeshRestResult restResult;
+            try {
+                IMResult<Void> imResult = MeshAdmin.addJoinGroupRequest(operator, groupId, userIds, reason, extra);
+                if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
+                    restResult = MeshRestResult.ok(imResult.result);
+                } else {
+                    restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+            }
+            deferredResult.setResult(restResult.toString());
+        });
+        return deferredResult;
+    }
+
     public Object quitGroupRequest(String domainId, String operator, String groupId) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
         CompletableFuture.runAsync(()->{
