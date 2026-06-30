@@ -694,6 +694,7 @@ public class OutService {
                 if(meshRestResult.getResult() != null && meshRestResult.getResult().getGroupInfoList() != null) {
                     for (PojoGroupInfo groupInfo : meshRestResult.getResult().getGroupInfoList()) {
                         groupInfo.setTarget_id(DomainIdUtils.toInternalId(domainId, groupInfo.getTarget_id(), myDomainId));
+                        groupInfo.setOwner(DomainIdUtils.toInternalId(domainId, groupInfo.getOwner(), myDomainId));
                     }
                 }
                 deferredResult.setResult(meshRestResult.toString());
