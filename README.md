@@ -130,3 +130,44 @@ nohup java -jar XXXX.jar 2>&1 &
 
 ## 功能和性能的损失
 某些功能做了舍弃，比如在线状态，阅读状态，因为跨网络同步这些信息时非常消耗资源且容易出错。不同IM服务之间的网络延迟也比同一个IM服务内部大好几个数量级，因此性能也会有不小的损耗。
+
+## 消息ID映射表的清理
+桥接服务在转发消息时，需要把本域消息ID和对端消息ID的对应关系保存下来，用于后续的消息撤回、更新等操作。这些对应关系分别保存在两张表中：
+
+* `in_message_ids`：记录接收（远端域 -> 本域）方向的消息ID映射，主键中的 `message_id` 是对端（发送方域）的消息ID。
+* `out_message_ids`：记录外发（本域 -> 远端域）方向的消息ID映射，主键 `id` 是本域IM服务生成的消息ID。
+
+随着消息量的增长，这两张表会不断累积记录，而很久之前的消息几乎不会再被撤回或更新，对应的映射也就不会再用到，因此可以定期清理旧数据。
+
+### 清理原理
+消息ID中已经编码了生成时间，算法见IM服务 `broker` 工程中的 `win.liyufan.im.MessageShardingUtil`。消息ID的结构为：
+
+```
+ID = timestamp(43bit) + nodeId(6bit) + rotateId(15bit)
+```
+
+其中 `timestamp` 是消息生成时的毫秒时间戳减去固定基准时间 `1514736000000`（对应 2018-01-01 00:00:00，UTC+8）。由于低 21 位（nodeId 6 位 + rotateId 15 位）与时间无关，可以由一个时间点反算出这个时间点“大概”的消息ID（低 21 位补 0），对应 `MessageShardingUtil.getMsgIdFromTimestamp(long timestamp)` 方法：
+
+```
+cutoffMid ≈ (毫秒时间戳 - 1514736000000) << 21
+```
+
+消息ID随时间单调递增，所以 `message_id` / `id` 小于 `cutoffMid` 的记录就是这个时间点之前产生的，直接删除即可。
+
+### 清理SQL（以MySQL为例）
+比如要删除 2025-01-01 之前的历史映射记录：
+
+```sql
+-- 计算截止消息ID（该时间点大概对应的消息ID）
+SET @cutoff_mid = (UNIX_TIMESTAMP('2025-01-01 00:00:00') * 1000 - 1514736000000) << 21;
+
+-- 先确认一下待删除的数量（可选）
+SELECT COUNT(*) FROM in_message_ids  WHERE message_id < @cutoff_mid;
+SELECT COUNT(*) FROM out_message_ids WHERE id < @cutoff_mid;
+
+-- 删除该时间点之前的映射记录
+DELETE FROM in_message_ids  WHERE message_id < @cutoff_mid;
+DELETE FROM out_message_ids WHERE id < @cutoff_mid;
+```
+
+保留的时间窗口根据业务对“撤回/更新历史消息”的需求确定，一般保留最近 1~3 个月即可。数据量很大时建议加 `LIMIT` 分批删除，避免长事务。
