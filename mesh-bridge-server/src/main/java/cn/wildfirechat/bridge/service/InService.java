@@ -8,6 +8,7 @@ import cn.wildfirechat.bridge.jpa.InMessageIdsRepository;
 import cn.wildfirechat.bridge.jpa.OutMessageIdsRepository;
 import cn.wildfirechat.pojos.*;
 import cn.wildfirechat.pojos.mesh.*;
+import cn.wildfirechat.proto.ProtoConstants;
 import cn.wildfirechat.sdk.MeshAdmin;
 import cn.wildfirechat.sdk.MessageAdmin;
 import cn.wildfirechat.sdk.RelationAdmin;
@@ -212,7 +213,10 @@ public class InService {
                     IMResult<SendMessageResult> imResult = MeshAdmin.publishMessage(messageData, receivers, outMessageIdOptional.isPresent()?outMessageIdOptional.get():0);
                     if (imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                         restResult = MeshRestResult.ok(imResult.result);
-                        if ((messageData.getPayload().getPersistFlag() & 0x01) > 0) {
+                        // if ((messageData.getPayload().getPersistFlag() & 0x01) > 0) {
+                        // 正常情况下，应该根据存储标记判断是否记录消息id对应关系，但server api很多情况下忽略了存储标记，导致server api发送的消息撤回/删除失败
+                        // 所以这里把透传消息以外的所有消息都记录下来。
+                        if (messageData.getPayload().getPersistFlag() != ProtoConstants.MessagePersistFlag.TRANSPARENT) {
                             InMessageIdsKey key = new InMessageIdsKey(messageId, domainId);
                             InMessageIds inMessageIds = new InMessageIds();
                             inMessageIds.id = key;

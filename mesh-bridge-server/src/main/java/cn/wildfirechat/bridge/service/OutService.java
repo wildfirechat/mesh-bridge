@@ -5,6 +5,7 @@ import cn.wildfirechat.bridge.utilis.DomainIdUtils;
 import cn.wildfirechat.bridge.utilis.HttpUtils;
 import cn.wildfirechat.pojos.*;
 import cn.wildfirechat.pojos.mesh.*;
+import cn.wildfirechat.proto.ProtoConstants;
 import cn.wildfirechat.sdk.messagecontent.MessageContent;
 import cn.wildfirechat.sdk.messagecontent.MessageContentFactory;
 import cn.wildfirechat.sdk.messagecontent.TextMessageContent;
@@ -275,7 +276,10 @@ public class OutService {
             public void onSuccess(String content) {
                 MeshRestResult<SendMessageResult> meshRestResult = JsonUtils.fromJsonObject2(content, SendMessageResult.class);
                 if(meshRestResult.getLocal_mesh_code() == 0 && meshRestResult.getRemote_mesh_code() == 0 && meshRestResult.getRemote_im_code() == 0) {
-                    if ((messageData.getPayload().getPersistFlag() & 0x01) > 0) {
+                    // if ((messageData.getPayload().getPersistFlag() & 0x01) > 0) {
+                    // 正常情况下，应该根据存储标记判断是否记录消息id对应关系，但server api很多情况下忽略了存储标记，导致server api发送的消息撤回/删除失败
+                    // 所以这里把透传消息以外的所有消息都记录下来。
+                    if (messageData.getPayload().getPersistFlag() != ProtoConstants.MessagePersistFlag.TRANSPARENT) {
                         OutMessageIds outMessageIds = new OutMessageIds();
                         outMessageIds.messageId = messageId;
                         outMessageIds.toDomainId = domainId;
