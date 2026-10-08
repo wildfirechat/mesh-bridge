@@ -16,6 +16,8 @@ public class OutMessageIds {
 
     public long toMessageId;
 
+    public String mediaUrl;
+
     public long getMessageId() {
         return messageId;
     }

@@ -262,40 +262,51 @@ public class OutService {
 
         messageData.getConv().setTarget(DomainIdUtils.toExternalId(domainId, messageData.getConv().getTarget(), myDomainId));
         messageData.setSender(DomainIdUtils.toExternalId(domainId, messageData.getSender(), myDomainId));
-        convertMessagePayloadDomainId(domainId, messageData.getPayload(), myDomainId);
 
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        PojoSendMessageReq req = new PojoSendMessageReq();
-        req.messageData = messageData;
-        req.clientId = sendClientId;
-        req.domainId = myDomainId;
-        req.messageId = messageId;
 
-        HttpUtils.httpPostToDomain(domain, "/send_message", req, new HttpUtils.HttpCallback() {
+        convertMessagePayloadDomainId(domainId, messageData.getPayload(), myDomainId, false, false, new ConvertCallback() {
             @Override
-            public void onSuccess(String content) {
-                MeshRestResult<SendMessageResult> meshRestResult = JsonUtils.fromJsonObject2(content, SendMessageResult.class);
-                if(meshRestResult.getLocal_mesh_code() == 0 && meshRestResult.getRemote_mesh_code() == 0 && meshRestResult.getRemote_im_code() == 0) {
-                    // if ((messageData.getPayload().getPersistFlag() & 0x01) > 0) {
-                    // 正常情况下，应该根据存储标记判断是否记录消息id对应关系，但server api很多情况下忽略了存储标记，导致server api发送的消息撤回/删除失败
-                    // 所以这里把透传消息以外的所有消息都记录下来。
-                    if (messageData.getPayload().getPersistFlag() != ProtoConstants.MessagePersistFlag.TRANSPARENT) {
-                        OutMessageIds outMessageIds = new OutMessageIds();
-                        outMessageIds.messageId = messageId;
-                        outMessageIds.toDomainId = domainId;
-                        outMessageIds.toMessageId = meshRestResult.getResult().getMessageUid();
-                        outMessageIdsRepository.save(outMessageIds);
-                        LOG.info("send out message success, from messageId {}, to messageId {}", messageId, meshRestResult.getResult().getMessageUid());
+            public void onSuccess() {
+                PojoSendMessageReq req = new PojoSendMessageReq();
+                req.messageData = messageData;
+                req.clientId = sendClientId;
+                req.domainId = myDomainId;
+                req.messageId = messageId;
+                HttpUtils.httpPostToDomain(domain, "/send_message", req, new HttpUtils.HttpCallback() {
+                    @Override
+                    public void onSuccess(String content) {
+                        MeshRestResult<SendMessageResult> meshRestResult = JsonUtils.fromJsonObject2(content, SendMessageResult.class);
+                        if(meshRestResult.getLocal_mesh_code() == 0 && meshRestResult.getRemote_mesh_code() == 0 && meshRestResult.getRemote_im_code() == 0) {
+                            // if ((messageData.getPayload().getPersistFlag() & 0x01) > 0) {
+                            // 正常情况下，应该根据存储标记判断是否记录消息id对应关系，但server api很多情况下忽略了存储标记，导致server api发送的消息撤回/删除失败
+                            // 所以这里把透传消息以外的所有消息都记录下来。
+                            if (messageData.getPayload().getPersistFlag() != ProtoConstants.MessagePersistFlag.TRANSPARENT) {
+                                OutMessageIds outMessageIds = new OutMessageIds();
+                                outMessageIds.messageId = messageId;
+                                outMessageIds.toDomainId = domainId;
+                                outMessageIds.toMessageId = meshRestResult.getResult().getMessageUid();
+                                outMessageIdsRepository.save(outMessageIds);
+                                LOG.info("send out message success, from messageId {}, to messageId {}", messageId, meshRestResult.getResult().getMessageUid());
+                            }
+                        } else {
+                            LOG.error("send out message failure! result: {}", content);
+                        }
+                        deferredResult.setResult(content);
                     }
-                } else {
-                    LOG.error("send out message failure! result: {}", content);
-                }
-                deferredResult.setResult(content);
+
+                    @Override
+                    public void onFailure(int statusCode, String errorMessage) {
+                        MeshRestResult meshRestResult = MeshRestResult.localMeshError(ERROR_SERVER_ERROR.code, "Http request error:" + statusCode + ". message:" + errorMessage);
+                        deferredResult.setResult(meshRestResult.toString());
+                    }
+                });
             }
 
             @Override
-            public void onFailure(int statusCode, String errorMessage) {
-                MeshRestResult meshRestResult = MeshRestResult.localMeshError(ERROR_SERVER_ERROR.code, "Http request error:" + statusCode + ". message:" + errorMessage);
+            public void onFailure(int error_code) {
+                LOG.error("onSendMessageRequest: convert message payload domain id error: {}", error_code);
+                MeshRestResult meshRestResult = MeshRestResult.localMeshError(ERROR_SERVER_ERROR.code, "convertMessagePayloadDomainId error code:" + error_code);
                 deferredResult.setResult(meshRestResult.toString());
             }
         });
@@ -327,13 +338,14 @@ public class OutService {
         }
     }
 
+    interface ConvertCallback {
+        void onSuccess();
+        void onFailure(int error_code);
+    }
+
     //这里是出去的消息进行转换的地方，消息中包含的用户ID/群组ID/频道ID和消息ID等需要转换为对方视角的ID。
     //理论上所有二开只能局限于这个函数。如果有其他改动容易出问题。如果其他地方需要改动，请给我们提PR或者联系我们修改，确保其他部分保持一致。
-    private void convertMessagePayloadDomainId(String remoteDomainId, MessagePayload messagePayload, String localDomainId) {
-        if(!TextUtils.isEmpty(messagePayload.getRemoteMediaUrl())) {
-            //如果本域的对象存储服务无法让其他域的用户直接访问，这里需要把文件异步传输到其他域中，且这里修改一下文件的地址。需要新写传输文件的方法。
-        }
-
+    private void convertMessagePayloadDomainId(String remoteDomainId, MessagePayload messagePayload, String localDomainId, boolean isPublish, boolean isPublish2OriganlDomain, ConvertCallback callback) {
         if(!messagePayload.getMentionedTarget().isEmpty()) {
             List<String> converted = new ArrayList<>();
             for (String s : messagePayload.getMentionedTarget()) {
@@ -464,6 +476,24 @@ public class OutService {
             }
             messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
         }
+
+        //如果本域的对象存储服务无法让其他域的用户直接访问，这里需要把文件异步传输到其他域中，且这里修改一下文件的地址。需要新写传输文件的方法。
+        if(!TextUtils.isEmpty(messagePayload.getRemoteMediaUrl())) {
+            // 有2种情况，一种是A domain的用户发送给B domain中的群，那么A域 send message request 到B 域，然后B 域处理
+            // 完本域中的用户后，再publish 到其他域，比如C域，如果有非A域的用户，也会publish到A域。
+            // 另外一种情况是A域中的用户发送到A域中的群，处理完本域内的用户后，再publish 到其他域，比如B域、C域，
+            // 所有就有A send 到B，B再 publish 回A的可能性，isPublish2OriganlDomain就是这种情况，这时就不需要再把文件传递到对方域了，需要用对方已经保存的地址。
+            if(isPublish2OriganlDomain) {
+                //忽略，直接用现有地址。对端服务收到后要根据地址找到本方地址。
+            } else {
+                // 发送文件到对方域，发送之后得到对方的域链接，修改这个链接地址后再发送。处理之后再调用callback.onSuccess();通知继续
+                if(!isPublish) {
+                    // 是发送的消息，需要记录本放地址和对方地址的对应关系，万一对方再publish回来，还需要根据对应关系找到本方的链接地址。
+                }
+
+            }
+        }
+        callback.onSuccess();
     }
 
     private boolean replaceOutString(JsonObject object, String key, String remoteDomainId, String localDomainId) {
@@ -517,7 +547,6 @@ public class OutService {
 
         messageData.getConv().setTarget(DomainIdUtils.toExternalId(domainId, messageData.getConv().getTarget(), myDomainId));
         messageData.setSender(DomainIdUtils.toExternalId(domainId, messageData.getSender(), myDomainId));
-        convertMessagePayloadDomainId(domainId, messageData.getPayload(), myDomainId);
 
         List<String> receiverIds = new ArrayList<>();
         for (String receiver : receivers) {
@@ -525,33 +554,49 @@ public class OutService {
         }
         DeferredResult<String> deferredResult = new DeferredResult<>();
         PojoPublishMessageReq req = new PojoPublishMessageReq();
-        req.messageData = messageData;
         req.receivers = receiverIds;
         req.domainId = myDomainId;
         req.republish = republish;
         req.messageId = messageId;
+        String originalMediaUrl = messageData.getPayload().getRemoteMediaUrl();
 
-        HttpUtils.httpPostToDomain(domain, "/publish_message", req, new HttpUtils.HttpCallback() {
+        convertMessagePayloadDomainId(domainId, messageData.getPayload(), myDomainId, true, DomainIdUtils.isSameExternalDomain(messageData.getConv().getTarget(), messageData.getSender()), new ConvertCallback() {
             @Override
-            public void onSuccess(String content) {
-                MeshRestResult<SendMessageResult> meshRestResult = JsonUtils.fromJsonObject2(content, SendMessageResult.class);
-                if(meshRestResult.getLocal_mesh_code() == 0 && meshRestResult.getRemote_mesh_code() == 0 && meshRestResult.getRemote_im_code() == 0) {
-                    OutMessageIds outMessageIds = new OutMessageIds();
-                    outMessageIds.messageId = messageId;
-                    outMessageIds.toDomainId = domainId;
-                    outMessageIds.toMessageId = meshRestResult.getResult().getMessageUid();
-                    outMessageIdsRepository.save(outMessageIds);
-                    LOG.info("publish out message success, local messageId {}, remote messageId {}", messageId, meshRestResult.getResult().getMessageUid());
-                } else {
-                    LOG.error("publish out message failure! result is {}", content);
-                }
+            public void onSuccess() {
+                req.messageData = messageData;
+                HttpUtils.httpPostToDomain(domain, "/publish_message", req, new HttpUtils.HttpCallback() {
+                    @Override
+                    public void onSuccess(String content) {
+                        MeshRestResult<SendMessageResult> meshRestResult = JsonUtils.fromJsonObject2(content, SendMessageResult.class);
+                        if(meshRestResult.getLocal_mesh_code() == 0 && meshRestResult.getRemote_mesh_code() == 0 && meshRestResult.getRemote_im_code() == 0) {
+                            OutMessageIds outMessageIds = new OutMessageIds();
+                            outMessageIds.messageId = messageId;
+                            outMessageIds.toDomainId = domainId;
+                            // 记录下地址，如果消息再分发回本域，可以找到地址进行替换
+                            outMessageIds.mediaUrl = originalMediaUrl;
+                            outMessageIds.toMessageId = meshRestResult.getResult().getMessageUid();
 
-                deferredResult.setResult(content);
+                            outMessageIdsRepository.save(outMessageIds);
+                            LOG.info("publish out message success, local messageId {}, remote messageId {}", messageId, meshRestResult.getResult().getMessageUid());
+                        } else {
+                            LOG.error("publish out message failure! result is {}", content);
+                        }
+
+                        deferredResult.setResult(content);
+                    }
+
+                    @Override
+                    public void onFailure(int statusCode, String errorMessage) {
+                        MeshRestResult meshRestResult = MeshRestResult.localMeshError(ERROR_SERVER_ERROR.code, "Http request error:" + statusCode + ". message:" + errorMessage);
+                        deferredResult.setResult(meshRestResult.toString());
+                    }
+                });
             }
 
             @Override
-            public void onFailure(int statusCode, String errorMessage) {
-                MeshRestResult meshRestResult = MeshRestResult.localMeshError(ERROR_SERVER_ERROR.code, "Http request error:" + statusCode + ". message:" + errorMessage);
+            public void onFailure(int error_code) {
+                LOG.error("onPublishMessageRequest: convert message payload domain id error: {}", error_code);
+                MeshRestResult meshRestResult = MeshRestResult.localMeshError(ERROR_SERVER_ERROR.code, "convertMessagePayloadDomainId error code:" + error_code);
                 deferredResult.setResult(meshRestResult.toString());
             }
         });

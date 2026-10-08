@@ -5,6 +5,7 @@ import cn.wildfirechat.common.ErrorCode;
 import cn.wildfirechat.bridge.jpa.InMessageIds;
 import cn.wildfirechat.bridge.jpa.InMessageIdsKey;
 import cn.wildfirechat.bridge.jpa.InMessageIdsRepository;
+import cn.wildfirechat.bridge.jpa.OutMessageIds;
 import cn.wildfirechat.bridge.jpa.OutMessageIdsRepository;
 import cn.wildfirechat.pojos.*;
 import cn.wildfirechat.pojos.mesh.*;
@@ -20,6 +21,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 import org.springframework.web.context.request.async.DeferredResult;
 
 import java.nio.charset.StandardCharsets;
@@ -169,6 +171,7 @@ public class InService {
         CompletableFuture.runAsync(()->{
             MeshRestResult restResult;
             try {
+                // republish消息是消息删除/撤回/更正后，重新发送的
                 if(republish) {
                     InMessageIdsKey key = new InMessageIdsKey(messageId, domainId);
                     Optional<InMessageIds> inMessageIdsOptional = inMessageIdsRepository.findById(key);
@@ -192,12 +195,16 @@ public class InService {
                         inExist = false;
                     }
 
-                    Optional<Long> outMessageIdOptional = outMessageIdsRepository.findByDomainIdAndToMessageId(domainId, messageId);
-                    if(outMessageIdOptional.isPresent()) {
-                        IMResult<Void> imResult = MeshAdmin.updateMessageContent(messageData.getSender(), outMessageIdOptional.get(), messageData.getPayload(), true);
+                    Optional<OutMessageIds> outMessageOptional = outMessageIdsRepository.findByToDomainIdAndToMessageId(domainId, messageId);
+                    if(outMessageOptional.isPresent()) {
+                        if(StringUtils.hasText(messageData.getPayload().getRemoteMediaUrl()) && StringUtils.hasText(outMessageOptional.get().mediaUrl) && !outMessageOptional.get().mediaUrl.equals(messageData.getPayload().getRemoteMediaUrl())) {
+                            //如果是从本域发出的再publish回来的消息，要把媒体地址改成本域里保存的地址，可以参考 convertMessagePayloadDomainId 方法里的对文件消息的处理
+                            messageData.getPayload().setRemoteMediaUrl(outMessageOptional.get().mediaUrl);
+                        }
+                        IMResult<Void> imResult = MeshAdmin.updateMessageContent(messageData.getSender(), outMessageOptional.get().messageId, messageData.getPayload(), true);
                         if (imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                             SendMessageResult sendMessageResult = new SendMessageResult();
-                            sendMessageResult.setMessageUid(outMessageIdOptional.get());
+                            sendMessageResult.setMessageUid(outMessageOptional.get().messageId);
                             sendMessageResult.setTimestamp(System.currentTimeMillis());
                             restResult = MeshRestResult.ok(sendMessageResult);
                         } else {
@@ -209,8 +216,12 @@ public class InService {
                         }
                     }
                 } else {
-                    Optional<Long> outMessageIdOptional = outMessageIdsRepository.findByDomainIdAndToMessageId(domainId, messageId);
-                    IMResult<SendMessageResult> imResult = MeshAdmin.publishMessage(messageData, receivers, outMessageIdOptional.isPresent()?outMessageIdOptional.get():0);
+                    Optional<OutMessageIds> outMessageOptional = outMessageIdsRepository.findByToDomainIdAndToMessageId(domainId, messageId);
+                    if(StringUtils.hasText(messageData.getPayload().getRemoteMediaUrl()) && StringUtils.hasText(outMessageOptional.get().mediaUrl) && !outMessageOptional.get().mediaUrl.equals(messageData.getPayload().getRemoteMediaUrl())) {
+                        //如果是从本域发出的再publish回来的消息，要把媒体地址改成本域里保存的地址，可以参考 convertMessagePayloadDomainId 方法里的对文件消息的处理
+                        messageData.getPayload().setRemoteMediaUrl(outMessageOptional.get().mediaUrl);
+                    }
+                    IMResult<SendMessageResult> imResult = MeshAdmin.publishMessage(messageData, receivers, outMessageOptional.isPresent()?outMessageOptional.get().messageId:0);
                     if (imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                         restResult = MeshRestResult.ok(imResult.result);
                         // if ((messageData.getPayload().getPersistFlag() & 0x01) > 0) {

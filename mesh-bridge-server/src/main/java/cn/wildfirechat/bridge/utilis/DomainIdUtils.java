@@ -51,4 +51,14 @@ public class DomainIdUtils {
         String[] ss = targetId.split(domainDivider);
         return ss[0];
     }
+
+    public static boolean isSameExternalDomain(String targetId1, String targetId2) {
+        if(!isExternalId(targetId1) || !isExternalId(targetId2)) {
+            return false;
+        } else {
+            String domainId1 = getExternalId(targetId1);
+            String domainId2 = getExternalId(targetId2);
+            return domainId1.equals(domainId2);
+        }
+    }
 }
