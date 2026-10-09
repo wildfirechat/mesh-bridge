@@ -24,11 +24,12 @@ public class OutMessageIds {
     @Column(name = "to_domain_id", length = 64)
     public String toDomainId;
 
+    @Column(name = "to_message_id")
     public long toMessageId;
 
     //本域保存的原始媒体地址。当消息被对端 publish 回本域时，用它还原成本域可访问的地址。
     //预签名地址可能很长，这里给足够的长度，避免 Data too long。
-    @Column(length = 1024)
+    @Column(name = "media_url", length = 1024)
     public String mediaUrl;
 
     public long getMessageId() {
