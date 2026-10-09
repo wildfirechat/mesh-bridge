@@ -3,6 +3,7 @@ package cn.wildfirechat.bridge.service;
 import cn.wildfirechat.bridge.jpa.*;
 import cn.wildfirechat.bridge.utilis.DomainIdUtils;
 import cn.wildfirechat.bridge.utilis.HttpUtils;
+import cn.wildfirechat.bridge.utilis.LimitedInputStream;
 import cn.wildfirechat.pojos.*;
 import cn.wildfirechat.pojos.mesh.*;
 import cn.wildfirechat.proto.ProtoConstants;
@@ -11,6 +12,13 @@ import cn.wildfirechat.sdk.messagecontent.MessageContentFactory;
 import cn.wildfirechat.sdk.messagecontent.TextMessageContent;
 import cn.wildfirechat.sdk.utilities.JsonUtils;
 import com.google.gson.*;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
+import okio.BufferedSink;
 import org.apache.http.util.TextUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,8 +29,20 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.context.request.async.DeferredResult;
 
 import javax.annotation.PostConstruct;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static cn.wildfirechat.pojos.mesh.MeshRestResult.MeshRestCode.*;
 
@@ -35,6 +55,29 @@ public class OutService {
 
     @Value("${bridge.domain_divider}")
     String domainDivider;
+
+    @Value("${bridge.media_public_accessible:true}")
+    boolean mediaPublicAccessible;
+
+    @Value("${bridge.file_transfer_timeout_minutes:10}")
+    int fileTransferTimeoutMinutes;
+
+    //文件传输的最大文件大小(MB)，0表示不限制
+    @Value("${bridge.file_transfer_max_size_mb:100}")
+    long fileTransferMaxSizeMb;
+
+    //文件传输并发线程数
+    @Value("${bridge.file_transfer_threads:4}")
+    int fileTransferThreads;
+
+    //允许下载的媒体地址主机白名单(逗号分隔)，为空表示不限制主机(仍只允许http/https)
+    @Value("${bridge.media_download_host_whitelist:}")
+    String mediaDownloadHostWhitelist;
+
+    OkHttpClient fileHttpClient;
+
+    //文件传输专用线程池，避免大文件传输长时间占用公共线程池。使用有界队列，队列满时直接失败而不是无限堆积。
+    ExecutorService transferFileExecutor;
 
     @Autowired
     OutMessageIdsRepository outMessageIdsRepository;
@@ -49,6 +92,25 @@ public class OutService {
     void init() {
         HttpUtils.setMyDomainId(myDomainId);
         DomainIdUtils.setDomainDivider(domainDivider);
+        fileHttpClient = new OkHttpClient.Builder()
+            .connectTimeout(Duration.ofSeconds(20))
+            .readTimeout(Duration.ofMinutes(fileTransferTimeoutMinutes))
+            .build();
+        int threads = fileTransferThreads > 0 ? fileTransferThreads : 4;
+        AtomicInteger threadIndex = new AtomicInteger();
+        ThreadFactory threadFactory = runnable -> {
+            Thread thread = new Thread(runnable, "mesh-file-transfer-" + threadIndex.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        };
+        transferFileExecutor = new ThreadPoolExecutor(threads, threads, 60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(200), threadFactory, new ThreadPoolExecutor.AbortPolicy());
+    }
+
+    //send_message/publish_message 内部可能先同步传输媒体文件，整个过程可能远超默认的30秒异步超时，
+    //这里给这两个接口单独设置更长的超时，避免请求先超时失败而后台仍然把消息发出去。
+    private DeferredResult<String> newTransferAwareDeferredResult() {
+        return new DeferredResult<>((fileTransferTimeoutMinutes + 1L) * 60L * 1000L);
     }
 
     public Object onPing(String domainId) {
@@ -263,8 +325,9 @@ public class OutService {
         messageData.getConv().setTarget(DomainIdUtils.toExternalId(domainId, messageData.getConv().getTarget(), myDomainId));
         messageData.setSender(DomainIdUtils.toExternalId(domainId, messageData.getSender(), myDomainId));
 
-        DeferredResult<String> deferredResult = new DeferredResult<>();
+        DeferredResult<String> deferredResult = newTransferAwareDeferredResult();
 
+        String originalMediaUrl = messageData.getPayload().getRemoteMediaUrl();
         convertMessagePayloadDomainId(domainId, messageData.getPayload(), myDomainId, false, false, new ConvertCallback() {
             @Override
             public void onSuccess() {
@@ -286,6 +349,7 @@ public class OutService {
                                 outMessageIds.messageId = messageId;
                                 outMessageIds.toDomainId = domainId;
                                 outMessageIds.toMessageId = meshRestResult.getResult().getMessageUid();
+                                outMessageIds.mediaUrl = originalMediaUrl;
                                 outMessageIdsRepository.save(outMessageIds);
                                 LOG.info("send out message success, from messageId {}, to messageId {}", messageId, meshRestResult.getResult().getMessageUid());
                             }
@@ -314,7 +378,7 @@ public class OutService {
         return deferredResult;
     }
 
-    private long convertMessageUid(String sender, long messageUid) {
+    private long convertMessageUid(String remoteDomainId, String sender, long messageUid) {
         // 根据发送者能够确定是本域发送的还是其他域发送的。再根据记录找到消息的对应关系，替换为对应域的消息ID
         if(DomainIdUtils.isExternalId(sender)) {
             //收到的消息
@@ -327,12 +391,12 @@ public class OutService {
                 return 0;
             }
         } else {
-            //发出去的消息
-            Optional<OutMessageIds> optionalOutMessageIds = outMessageIdsRepository.findById(messageUid);
+            //发出去的消息。一条本域消息可能发往多个域，每个域的对端消息ID不同，必须带上目标域才能取到正确的映射
+            Optional<OutMessageIds> optionalOutMessageIds = outMessageIdsRepository.findByMessageIdAndToDomainId(messageUid, remoteDomainId);
             if(optionalOutMessageIds.isPresent()) {
                 return optionalOutMessageIds.get().getToMessageId();
             } else {
-                LOG.error("Convert message uid {} failed. The message is from local domain", messageUid);
+                LOG.error("Convert message uid {} failed. The message is from local domain, remoteDomainId {}", messageUid, remoteDomainId);
                 return 0;
             }
         }
@@ -362,7 +426,7 @@ public class OutService {
                     // 文本消息，有可能有引用，引用信息中包含消息ID，这个消息ID在每个域中都是不同的。也包含发送者用户ID。
 
                     // 替换消息ID
-                    long targetMessageUid = convertMessageUid(txtContent.getQuoteInfo().getUserId(), txtContent.getQuoteInfo().getMessageUid());
+                    long targetMessageUid = convertMessageUid(remoteDomainId, txtContent.getQuoteInfo().getUserId(), txtContent.getQuoteInfo().getMessageUid());
                     txtContent.getQuoteInfo().setMessageUid(targetMessageUid);
 
                     // 发送者转换域地址。
@@ -433,7 +497,7 @@ public class OutService {
                 //当出现这种情况时，需要升级IM服务，让删除消息带上发送者信息.
                 LOG.error("撤回或删除消息内容，消息体中没有找到发送者。如果消息是对方域用户发送，删除将失败！");
             }
-            long targetMessageUid = convertMessageUid(originalSender, messageUid);
+            long targetMessageUid = convertMessageUid(remoteDomainId, originalSender, messageUid);
             messagePayload.setBase64edData(Base64.getEncoder().encodeToString(String.valueOf(targetMessageUid).getBytes(StandardCharsets.UTF_8)));
 
             //替换操作者
@@ -482,15 +546,27 @@ public class OutService {
             // 有2种情况，一种是A domain的用户发送给B domain中的群，那么A域 send message request 到B 域，然后B 域处理
             // 完本域中的用户后，再publish 到其他域，比如C域，如果有非A域的用户，也会publish到A域。
             // 另外一种情况是A域中的用户发送到A域中的群，处理完本域内的用户后，再publish 到其他域，比如B域、C域，
-            // 所有就有A send 到B，B再 publish 回A的可能性，isPublish2OriganlDomain就是这种情况，这时就不需要再把文件传递到对方域了，需要用对方已经保存的地址。
+            // 所以就有A send 到B，B再 publish 回A的可能性，isPublish2OriganlDomain就是这种情况，这时就不需要再把文件传递到对方域了，需要用对方已经保存的地址。
             if(isPublish2OriganlDomain) {
                 //忽略，直接用现有地址。对端服务收到后要根据地址找到本方地址。
             } else {
                 // 发送文件到对方域，发送之后得到对方的域链接，修改这个链接地址后再发送。处理之后再调用callback.onSuccess();通知继续
-                if(!isPublish) {
-                    // 是发送的消息，需要记录本放地址和对方地址的对应关系，万一对方再publish回来，还需要根据对应关系找到本方的链接地址。
-                }
+                if(!mediaPublicAccessible) {
+                    transferFile(remoteDomainId, messagePayload.getRemoteMediaUrl(), messagePayload.getMediaType(), new TransferFileCallback() {
+                        @Override
+                        public void onSuccess(String remoteMediaUrl) {
+                            messagePayload.setRemoteMediaUrl(remoteMediaUrl);
+                            callback.onSuccess();
+                        }
 
+                        @Override
+                        public void onFailure(int errorCode, String errorMessage) {
+                            LOG.error("transfer file to domain {} failure, mediaUrl {}, error: {}", remoteDomainId, messagePayload.getRemoteMediaUrl(), errorMessage);
+                            callback.onFailure(errorCode);
+                        }
+                    });
+                    return;
+                }
             }
         }
         callback.onSuccess();
@@ -552,7 +628,7 @@ public class OutService {
         for (String receiver : receivers) {
             receiverIds.add(DomainIdUtils.toExternalId(domainId, receiver, myDomainId));
         }
-        DeferredResult<String> deferredResult = new DeferredResult<>();
+        DeferredResult<String> deferredResult = newTransferAwareDeferredResult();
         PojoPublishMessageReq req = new PojoPublishMessageReq();
         req.receivers = receiverIds;
         req.domainId = myDomainId;
@@ -618,7 +694,7 @@ public class OutService {
         req.operator = DomainIdUtils.toExternalId(domainId, operator, myDomainId);
         req.domainId = myDomainId;
         if(isSenderRecall) {
-            Optional<OutMessageIds> optionalOutMessageIds = outMessageIdsRepository.findById(messageId);
+            Optional<OutMessageIds> optionalOutMessageIds = outMessageIdsRepository.findByMessageIdAndToDomainId(messageId, domainId);
             if(!optionalOutMessageIds.isPresent()) {
                 MeshRestResult meshRestResult = MeshRestResult.localMeshError(ERROR_NOT_EXIST.code, "Message Id not found");
                 deferredResult.setResult(meshRestResult.toString());
@@ -661,6 +737,145 @@ public class OutService {
         });
 
         return deferredResult;
+    }
+
+    interface TransferFileCallback {
+        void onSuccess(String remoteMediaUrl);
+        void onFailure(int errorCode, String errorMessage);
+    }
+
+    //把媒体文件传输到对方域。本方的对象存储地址域外无法访问，需要先在本方下载，边下边传给对端，成功后回调返回对方域保存后的文件地址
+    private void transferFile(String remoteDomainId, String mediaUrl, int mediaType, TransferFileCallback callback) {
+        if(!isAllowedMediaUrl(mediaUrl)) {
+            LOG.error("transfer file to domain {} rejected, illegal mediaUrl {}", remoteDomainId, mediaUrl);
+            callback.onFailure(ERROR_INVALID_PARAMETER.code, "媒体地址不合法，只允许http/https且需要在白名单内");
+            return;
+        }
+        Optional<Domain> optionalDomain = domainRepository.findById(remoteDomainId);
+        if(!optionalDomain.isPresent()) {
+            callback.onFailure(ERROR_NOT_EXIST.code, "服务实体（" + remoteDomainId + ")不存在");
+            return;
+        }
+        Domain domain = optionalDomain.get();
+
+        try {
+            transferFileExecutor.execute(() -> doTransferFile(domain, remoteDomainId, mediaUrl, mediaType, callback));
+        } catch (RejectedExecutionException e) {
+            LOG.error("transfer file to domain {} rejected, queue is full, mediaUrl {}", remoteDomainId, mediaUrl);
+            callback.onFailure(ERROR_SERVER_ERROR.code, "文件传输队列已满，请稍后重试");
+        }
+    }
+
+    private void doTransferFile(Domain domain, String remoteDomainId, String mediaUrl, int mediaType, TransferFileCallback callback) {
+        try (Response downloadResponse = fileHttpClient.newCall(new Request.Builder().url(mediaUrl).get().build()).execute()) {
+            if(!downloadResponse.isSuccessful() || downloadResponse.body() == null) {
+                callback.onFailure(ERROR_SERVER_ERROR.code, "download file from local media server failure, mediaUrl:" + mediaUrl + ", status code:" + downloadResponse.code());
+                return;
+            }
+            final ResponseBody downloadBody = downloadResponse.body();
+            final String contentType = downloadBody.contentType() != null ? downloadBody.contentType().toString() : null;
+            final long maxBytes = fileTransferMaxSizeMb > 0 ? fileTransferMaxSizeMb * 1024 * 1024 : -1;
+            final long contentLength = downloadBody.contentLength();
+            if(maxBytes > 0 && contentLength > maxBytes) {
+                callback.onFailure(ERROR_INVALID_PARAMETER.code, "文件超过大小限制 " + fileTransferMaxSizeMb + "MB");
+                return;
+            }
+            final InputStream downloadStream = maxBytes > 0 ? new LimitedInputStream(downloadBody.byteStream(), maxBytes) : downloadBody.byteStream();
+
+            //上传的body从下载流中读取，边下边传，文件不落地
+            RequestBody uploadBody = new RequestBody() {
+                @Override
+                public MediaType contentType() {
+                    return contentType != null ? MediaType.parse(contentType) : null;
+                }
+
+                @Override
+                public long contentLength() {
+                    return contentLength;
+                }
+
+                @Override
+                public boolean isOneShot() {
+                    //流是一次性的，禁止OkHttp重试时重复调用writeTo
+                    return true;
+                }
+
+                @Override
+                public void writeTo(BufferedSink sink) throws IOException {
+                    byte[] buffer = new byte[8192];
+                    int read;
+                    while ((read = downloadStream.read(buffer)) != -1) {
+                        sink.write(buffer, 0, read);
+                    }
+                    sink.flush();
+                }
+            };
+
+            Map<String, String> extraHeaders = new HashMap<>();
+            extraHeaders.put("x-media-type", String.valueOf(mediaType));
+            extraHeaders.put("x-file-extension", extensionOf(mediaUrl));
+
+            String content = HttpUtils.httpPostStreamToDomain(domain, "/transfer_file", extraHeaders, uploadBody, fileTransferTimeoutMinutes);
+            MeshRestResult<String> meshRestResult = JsonUtils.fromJsonObject2(content, String.class);
+            if(meshRestResult.getLocal_mesh_code() == 0 && meshRestResult.getRemote_mesh_code() == 0 && meshRestResult.getRemote_im_code() == 0 && !TextUtils.isEmpty(meshRestResult.getResult())) {
+                callback.onSuccess(meshRestResult.getResult());
+            } else {
+                callback.onFailure(ERROR_SERVER_ERROR.code, "transfer file failure! result: " + content);
+            }
+        } catch (Exception e) {
+            LOG.error("transfer file to domain {} failure, mediaUrl {}", remoteDomainId, mediaUrl, e);
+            callback.onFailure(ERROR_SERVER_ERROR.code, "transfer file failure");
+        }
+    }
+
+    //只允许http/https，避免file://等协议；可配置主机白名单进一步收紧，防止被诱导去访问内网其他服务
+    private boolean isAllowedMediaUrl(String mediaUrl) {
+        if(!StringUtils.hasText(mediaUrl)) {
+            return false;
+        }
+        try {
+            URI uri = new URI(mediaUrl);
+            String scheme = uri.getScheme();
+            if(scheme == null) {
+                return false;
+            }
+            scheme = scheme.toLowerCase();
+            if(!"http".equals(scheme) && !"https".equals(scheme)) {
+                return false;
+            }
+            String host = uri.getHost();
+            if(!StringUtils.hasText(host)) {
+                return false;
+            }
+            if(StringUtils.hasText(mediaDownloadHostWhitelist)) {
+                for (String allowed : mediaDownloadHostWhitelist.split(",")) {
+                    if(host.equalsIgnoreCase(allowed.trim())) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            return true;
+        } catch (URISyntaxException e) {
+            return false;
+        }
+    }
+
+    private static String extensionOf(String mediaUrl) {
+        String path = mediaUrl;
+        int queryIndex = path.indexOf('?');
+        if(queryIndex >= 0) {
+            path = path.substring(0, queryIndex);
+        }
+        int dotIndex = path.lastIndexOf('.');
+        if(dotIndex > path.lastIndexOf('/') && dotIndex < path.length() - 1) {
+            String extension = path.substring(dotIndex);
+            //只保留字母数字后缀，防止非法字符导致header非法或者文件名被注入
+            if(extension.matches("^\\.[A-Za-z0-9]{1,10}$")) {
+                return extension;
+            }
+        }
+        return "";
     }
 
     public Object onBatchGetUserInfoRequest(String domainId, List<String> userIds) {

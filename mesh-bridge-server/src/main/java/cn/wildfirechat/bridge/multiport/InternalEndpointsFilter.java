@@ -79,7 +79,7 @@ public class InternalEndpointsFilter implements Filter {
                 }
 
                 String domainId = ((RequestFacade) servletRequest).getHeader("x-domain-id");
-                if (!StringUtils.hasText(sign)) {
+                if (!StringUtils.hasText(domainId)) {
                     domainId = ((RequestFacade) servletRequest).getHeader("X-domain-id");
                 }
 

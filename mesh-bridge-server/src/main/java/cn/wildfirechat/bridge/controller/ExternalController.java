@@ -5,7 +5,11 @@ import cn.wildfirechat.pojos.mesh.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.*;
+
+import javax.servlet.http.HttpServletRequest;
+import java.io.IOException;
 
 @RestController
 @RequestMapping("/api")
@@ -57,6 +61,21 @@ public class ExternalController {
     @PostMapping(value = "/recall_message", produces = "application/json;charset=UTF-8")
     public Object recallMessage(@RequestBody PojoRecallMessageReq recallMessageReq) {
         return inService.onRecallMessageRequest(recallMessageReq.domainId, recallMessageReq.messageId, recallMessageReq.operator, recallMessageReq.isSenderRecall);
+    }
+
+    //接收对端传输过来的文件流，mediaType在x-media-type header中，文件后缀名在x-file-extension header中
+    @PostMapping(value = "/transfer_file", produces = "application/json;charset=UTF-8")
+    public Object transferFile(HttpServletRequest request) throws IOException {
+        int mediaType = 0;
+        String mediaTypeHeader = request.getHeader("x-media-type");
+        if(StringUtils.hasText(mediaTypeHeader)) {
+            try {
+                mediaType = Integer.parseInt(mediaTypeHeader);
+            } catch (NumberFormatException e) {
+                LOG.error("invalid x-media-type header: {}", mediaTypeHeader);
+            }
+        }
+        return inService.onTransferFileRequest(request.getHeader("x-domain-id"), request.getInputStream(), request.getHeader("x-file-extension"), request.getContentType(), mediaType, request.getContentLengthLong());
     }
 
     @PostMapping(value = "/batch_user_infos", produces = "application/json;charset=UTF-8")

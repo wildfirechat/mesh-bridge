@@ -120,7 +120,18 @@ nohup java -jar XXXX.jar 2>&1 &
 ***因为互通的技术比较复杂且又由客户自己来部署，所以此项目必须由技术上能够完全掌握和自己有能力处理问题的团队使用，我们无法对此项目做一般性的技术支持。技术支持仅限于用我们demo进行验证，根据demo来提交问题，或者深入接口级别的问题，比如那个接口的行为不对或者那个回调参数不对等。我们无法接受笼统的问题。***
 
 ## 对象存储的处理
-野火IM媒体类消息的发送过程都是先去自己所在IM服务拿到一个上传token，再把文件发送到自己的媒体服务器，再把连接放到消息体内发送出去。因此可以得知，文件都会保存在发送者所在IM服务的对象存储服务中。其他域的用户拿到消息后如果能访问对象链接地址，那么就可以不需要额外处理。如果限定仅能在本域内访问，则消息发送和分发时需要把文件传输到对端去。在OutService中的convertMessagePayloadDomainId方法中开头有注释，依据注释来开发传输文件的代码。唯一的问题是，有一定的时间差，其他域的用户收到消息后，可能需要一段时间才可以访问对象文件，如果找不到文件可以UI上加一些提示，比如提示文件正在处理请稍后提示。
+野火IM媒体类消息的发送过程都是先去自己所在IM服务拿到一个上传token，再把文件发送到自己的媒体服务器，再把连接放到消息体内发送出去。因此可以得知，文件都会保存在发送者所在IM服务的对象存储服务中。其他域的用户拿到消息后如果能访问对象链接地址，那么就可以不需要额外处理。如果限定仅能在本域内访问，则消息发送和分发时需要把文件传输到对端去。
+
+桥接服务已经实现了这个传输逻辑：当 `bridge.media_public_accessible=false` 时，发送方会先把媒体文件从本域对象存储下载下来，边下边传到目标域的 `/api/transfer_file`，目标域再把流上传到自己的对象存储，并把新的可访问地址写回消息体。传输是同步的（传输完成后才发送消息），因此对端用户收到消息时文件一般已经可用，但传输时间会算在本次发送的耗时里，需要确保 `bridge.file_transfer_timeout_minutes` 不要超过上游 IM 服务回调桥接服务的超时时间。
+
+相关配置：
+
+* `bridge.media_public_accessible`：本域对象存储是否可被其他域直接访问，默认 `true`（不做传输）。
+* `minio.endpoint` / `minio.access_key` / `minio.secret_key`：接收文件时使用的对象存储（即使本域只发送、且媒体公开，也建议配置齐全）。
+* `media.bucket_<type>_name` / `media.bucket_<type>_domain`：按 mediaType 区分的桶名和对外访问地址（网关/CDN），`type` 取值 `general/image/voice/video/file/portrait/favorite/sticker/moments`。`domain` 必须能直接访问到对应桶里的对象，否则对端会拿不到文件。
+* `bridge.file_transfer_max_size_mb`：单文件大小上限（MB），`0` 表示不限制。
+* `bridge.file_transfer_threads`：并发传输线程数，使用有界队列。
+* `bridge.media_download_host_whitelist`：允许下载的媒体地址主机白名单（逗号分隔），为空表示不限制主机（始终只允许 http/https）。
 
 ## 音视频通话
 野火的音视频有2个，一个是免费版本的，另外一个是高级版。这两个版本是不能互通的。所有如果需要音视频通话，那么所有的域都要使用相同的音视频。在使用免费版本音视频时，需要有turn服务可以供双方访问。在使用高级版音视频时，需要janus服务可以被双方访问，或者添加部署能被对方访问的turn服务作为中继。
@@ -135,7 +146,23 @@ nohup java -jar XXXX.jar 2>&1 &
 桥接服务在转发消息时，需要把本域消息ID和对端消息ID的对应关系保存下来，用于后续的消息撤回、更新等操作。这些对应关系分别保存在两张表中：
 
 * `in_message_ids`：记录接收（远端域 -> 本域）方向的消息ID映射，主键中的 `message_id` 是对端（发送方域）的消息ID。
-* `out_message_ids`：记录外发（本域 -> 远端域）方向的消息ID映射，主键 `id` 是本域IM服务生成的消息ID。
+* `out_message_ids`：记录外发（本域 -> 远端域）方向的消息ID映射，主键是 `(id, to_domain_id)` 的组合，`id` 是本域IM服务生成的消息ID，`to_domain_id` 是目标域ID。因为同一条本域消息可能会 publish 到多个远端域，每个域会分配不同的对端消息ID，所以必须用组合主键。表中还保存了本域原始的媒体地址 `media_url`，用于消息被对端 publish 回本域时还原成本域可访问的地址。
+
+> **升级说明**：如果是从旧版本升级，`out_message_ids` 原来的主键只有 `id`，请先执行下面的 SQL 改成组合主键（`ddl-auto=update` 不会自动修改主键）：
+>
+> ```sql
+> DELETE FROM out_message_ids WHERE to_domain_id IS NULL;
+> ALTER TABLE out_message_ids DROP PRIMARY KEY, ADD PRIMARY KEY (id, to_domain_id);
+> ```
+>
+> 同时建议确认 `media_url` 列长度足够（代码中已声明为 1024），并补上反查索引：
+>
+> ```sql
+> ALTER TABLE out_message_ids MODIFY COLUMN media_url VARCHAR(1024);
+> CREATE INDEX idx_out_msg_to_domain_msg ON out_message_ids (to_domain_id, to_message_id);
+> ```
+>
+> 全新部署无需此步骤。
 
 随着消息量的增长，这两张表会不断累积记录，而很久之前的消息几乎不会再被撤回或更新，对应的映射也就不会再用到，因此可以定期清理旧数据。
 

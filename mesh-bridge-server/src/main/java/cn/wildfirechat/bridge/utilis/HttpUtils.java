@@ -66,6 +66,28 @@ public class HttpUtils {
         httpCallbackJsonPost(url, jsonStr, headers, httpCallback, httpClient);
     }
 
+    //以流的形式POST文件到对端域，body可以是边下边传的流式RequestBody。文件可能比较大，读写超时单独设置
+    public static String httpPostStreamToDomain(Domain domain, String path, Map<String, String> extraHeaders, RequestBody body, int timeoutMinutes) throws IOException {
+        String url = domain.url + path;
+        Headers.Builder headersBuilder = getSignHeaders(domain).newBuilder();
+        if(extraHeaders != null) {
+            extraHeaders.forEach(headersBuilder::add);
+        }
+        OkHttpClient httpClient = httpClientMap.computeIfAbsent(domain.domainId, integer -> new OkHttpClient(new OkHttpClient.Builder().connectTimeout(Duration.ofSeconds(20))))
+            .newBuilder().readTimeout(Duration.ofMinutes(timeoutMinutes)).writeTimeout(Duration.ofMinutes(timeoutMinutes)).build();
+        Request request = new Request.Builder()
+            .url(url)
+            .post(body)
+            .headers(headersBuilder.build())
+            .build();
+        try (Response response = httpClient.newCall(request).execute()) {
+            if(response.code() == 200 && response.body() != null) {
+                return response.body().string();
+            }
+            throw new IOException("POST to " + url + " failure, status code:" + response.code());
+        }
+    }
+
     private static void httpCallbackJsonPost(final String url, final String jsonStr, final Headers headers, final HttpCallback httpCallback, final OkHttpClient client) {
         //消息推送内容为 {"sender":"uCGUxUaa","senderName":"杨","convType":0,"target":"usq7v7UU","targetName":"鞋子","userId":"usq7v7UU","line":0,"cntType":400,"serverTime":1610590766485,"pushMessageType":1,"pushType":2,"pushContent":"","pushData":"","unReceivedMsg":1,"mentionedType":0,"packageName":"cn.wildfirechat.chat","deviceToken":"AFoieP9P6u6CccIkRK23gRwUJWKqSkdiqnb-6gC1kL7Wv-9XNoEYBPU7VsINU_q8_WTKfafe35qWu7ya7Z-NmgOTX9XVW3A3zd6ilh--quj6ccINXRvVnh8QmI9QQ","isHiddenDetail":false,"language":"zh"}
         //推送信息只打印前100个字符，防止敏感信息打印到日志中去。
