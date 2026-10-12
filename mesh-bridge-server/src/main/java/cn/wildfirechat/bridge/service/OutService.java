@@ -12,6 +12,9 @@ import cn.wildfirechat.sdk.messagecontent.MessageContentFactory;
 import cn.wildfirechat.sdk.messagecontent.TextMessageContent;
 import cn.wildfirechat.sdk.utilities.JsonUtils;
 import com.google.gson.*;
+import io.minio.GetPresignedObjectUrlArgs;
+import io.minio.MinioClient;
+import io.minio.http.Method;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -24,6 +27,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import org.springframework.web.context.request.async.DeferredResult;
@@ -74,6 +78,20 @@ public class OutService {
     @Value("${bridge.media_download_host_whitelist:}")
     String mediaDownloadHostWhitelist;
 
+    @Value("${minio.endpoint}")
+    String minioEndpoint;
+
+    @Value("${minio.access_key}")
+    String minioAccessKey;
+
+    @Value("${minio.secret_key}")
+    String minioSecretKey;
+
+    @Autowired
+    Environment environment;
+
+    MinioClient minioClient;
+
     OkHttpClient fileHttpClient;
 
     //文件传输专用线程池，避免大文件传输长时间占用公共线程池。使用有界队列，队列满时直接失败而不是无限堆积。
@@ -105,6 +123,7 @@ public class OutService {
         };
         transferFileExecutor = new ThreadPoolExecutor(threads, threads, 60L, TimeUnit.SECONDS,
             new LinkedBlockingQueue<>(200), threadFactory, new ThreadPoolExecutor.AbortPolicy());
+        minioClient = MinioClient.builder().endpoint(minioEndpoint).credentials(minioAccessKey, minioSecretKey).build();
     }
 
     //send_message/publish_message 内部可能先同步传输媒体文件，整个过程可能远超默认的30秒异步超时，
@@ -767,7 +786,9 @@ public class OutService {
     }
 
     private void doTransferFile(Domain domain, String remoteDomainId, String mediaUrl, int mediaType, TransferFileCallback callback) {
-        try (Response downloadResponse = fileHttpClient.newCall(new Request.Builder().url(mediaUrl).get().build()).execute()) {
+        //本域对象存储可能是私有读，如果地址是本域配置的桶地址，先签名出1小时内可读的临时地址再下载
+        String downloadUrl = presignLocalMediaUrl(mediaUrl);
+        try (Response downloadResponse = fileHttpClient.newCall(new Request.Builder().url(downloadUrl).get().build()).execute()) {
             if(!downloadResponse.isSuccessful() || downloadResponse.body() == null) {
                 callback.onFailure(ERROR_SERVER_ERROR.code, "download file from local media server failure, mediaUrl:" + mediaUrl + ", status code:" + downloadResponse.code());
                 return;
@@ -826,6 +847,43 @@ public class OutService {
             LOG.error("transfer file to domain {} failure, mediaUrl {}", remoteDomainId, mediaUrl, e);
             callback.onFailure(ERROR_SERVER_ERROR.code, "transfer file failure");
         }
+    }
+
+    //与InService.bucketTypeOf对应的全部桶类型，用于按配置的对象存储地址反查桶名
+    private static final String[] BUCKET_TYPES = {"general", "image", "voice", "video", "file", "portrait", "favorite", "sticker", "moments"};
+
+    //本域媒体文件可能是私有读，直接下载会403。如果地址匹配本域配置的某个桶地址(media.bucket_*_domain)，
+    //用minio客户端签名出一个1小时内可读的临时地址；不匹配或签名失败时返回原地址。
+    private String presignLocalMediaUrl(String mediaUrl) {
+        for (String type : BUCKET_TYPES) {
+            String bucketDomain = environment.getProperty("media.bucket_" + type + "_domain");
+            String bucket = environment.getProperty("media.bucket_" + type + "_name");
+            if(!StringUtils.hasText(bucketDomain) || !StringUtils.hasText(bucket)) {
+                continue;
+            }
+            String prefix = StringUtils.trimTrailingCharacter(bucketDomain, '/') + "/";
+            if(!mediaUrl.startsWith(prefix)) {
+                continue;
+            }
+            String objectName = mediaUrl.substring(prefix.length());
+            int queryIndex = objectName.indexOf('?');
+            if(queryIndex >= 0) {
+                objectName = objectName.substring(0, queryIndex);
+            }
+            if(!StringUtils.hasText(objectName)) {
+                continue;
+            }
+            try {
+                String presignedUrl = minioClient.getPresignedObjectUrl(GetPresignedObjectUrlArgs.builder()
+                    .method(Method.GET).bucket(bucket).object(objectName).expiry(1, TimeUnit.HOURS).build());
+                LOG.info("presign local media url {} for download", mediaUrl);
+                return presignedUrl;
+            } catch (Exception e) {
+                LOG.warn("presign local media url {} failure, download with original url", mediaUrl, e);
+                return mediaUrl;
+            }
+        }
+        return mediaUrl;
     }
 
     //只允许http/https，避免file://等协议；可配置主机白名单进一步收紧，防止被诱导去访问内网其他服务
