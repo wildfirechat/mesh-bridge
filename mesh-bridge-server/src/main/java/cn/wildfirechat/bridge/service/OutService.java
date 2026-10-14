@@ -565,7 +565,8 @@ public class OutService {
             // 有2种情况，一种是A domain的用户发送给B domain中的群，那么A域 send message request 到B 域，然后B 域处理
             // 完本域中的用户后，再publish 到其他域，比如C域，如果有非A域的用户，也会publish到A域。
             // 另外一种情况是A域中的用户发送到A域中的群，处理完本域内的用户后，再publish 到其他域，比如B域、C域，
-            // 所以就有A send 到B，B再 publish 回A的可能性，isPublish2OriganlDomain就是这种情况，这时就不需要再把文件传递到对方域了，需要用对方已经保存的地址。
+            // 所以就有A send 到B，B再 publish 回A的可能性，isPublish2OriganlDomain就是这种情况(publish的目标域就是消息发送者所在域)，
+            // 这时就不需要再把文件传递到对方域了，需要用对方已经保存的地址。
             if(isPublish2OriganlDomain) {
                 //忽略，直接用现有地址。对端服务收到后要根据地址找到本方地址。
             } else {
@@ -640,6 +641,10 @@ public class OutService {
         }
         Domain domain = optionalDomain.get();
 
+        //判断是否publish回消息发送者所在域。必须在ID转换之前判断：转换后本域的群ID和发送者ID都会带上本域后缀，
+        //会把"本域群+本域发送者"的正常跨域publish误判成publish回原域，导致跳过文件传输
+        boolean isPublish2OriganlDomain = DomainIdUtils.isExternalId(messageData.getSender()) && domainId.equals(DomainIdUtils.getExternalId(messageData.getSender()));
+
         messageData.getConv().setTarget(DomainIdUtils.toExternalId(domainId, messageData.getConv().getTarget(), myDomainId));
         messageData.setSender(DomainIdUtils.toExternalId(domainId, messageData.getSender(), myDomainId));
 
@@ -655,7 +660,7 @@ public class OutService {
         req.messageId = messageId;
         String originalMediaUrl = messageData.getPayload().getRemoteMediaUrl();
 
-        convertMessagePayloadDomainId(domainId, messageData.getPayload(), myDomainId, true, DomainIdUtils.isSameExternalDomain(messageData.getConv().getTarget(), messageData.getSender()), new ConvertCallback() {
+        convertMessagePayloadDomainId(domainId, messageData.getPayload(), myDomainId, true, isPublish2OriganlDomain, new ConvertCallback() {
             @Override
             public void onSuccess() {
                 req.messageData = messageData;
