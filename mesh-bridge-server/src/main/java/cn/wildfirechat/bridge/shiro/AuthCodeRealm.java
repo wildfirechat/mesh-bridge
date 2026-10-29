@@ -14,6 +14,8 @@ import org.apache.shiro.authz.SimpleAuthorizationInfo;
 import org.apache.shiro.realm.AuthorizingRealm;
 import org.apache.shiro.subject.PrincipalCollection;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
@@ -22,6 +24,7 @@ import java.util.Set;
 
 @Service
 public class AuthCodeRealm extends AuthorizingRealm {
+    private static final Logger LOG = LoggerFactory.getLogger(AuthCodeRealm.class);
 
     @Autowired
     private AuthCodeMatcher authCodeMatcher;
@@ -57,7 +60,7 @@ public class AuthCodeRealm extends AuthorizingRealm {
                     return simpleAuthenticationInfo;
                 }
             } catch (Exception e) {
-                e.printStackTrace();
+                LOG.warn("application auth code check failed", e);
             }
         }
 

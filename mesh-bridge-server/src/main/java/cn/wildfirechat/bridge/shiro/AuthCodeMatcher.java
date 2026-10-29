@@ -11,9 +11,7 @@ public class AuthCodeMatcher implements CredentialsMatcher {
 
     @Override
     public boolean doCredentialsMatch(AuthenticationToken token, AuthenticationInfo info) {
-        if (token instanceof AuthCodeToken && info instanceof SimpleAuthenticationInfo) {
-            return true;
-        }
+        // AuthCodeRealm 已从 SecurityManager 移除。保留 fail-closed，避免未来误启用时无条件通过。
         return false;
     }
 }

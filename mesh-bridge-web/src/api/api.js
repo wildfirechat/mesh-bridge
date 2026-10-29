@@ -16,6 +16,14 @@ export default {
             newPassword
         })
     },
+    logout() {
+        return axios.post('/logout')
+    },
+    getIMDomain(domainId) {
+        return axios.post('/get_domain', {
+            domainId
+        })
+    },
     createIMDomain(imDomain) {
         return axios.post('/create_domain', imDomain)
     },

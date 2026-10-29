@@ -34,22 +34,22 @@ IM服务： 野火IM服务，IM系统的核心服务。只有专业版IM服务�
 npm install
 npm run build
 ```
-编译脚本会自动把生成的管理页面放到服务的资源目录，部署服务后就可以输入http://${ip}:8000访问到管理页面了.
+编译脚本会自动把生成的管理页面放到服务的资源目录，部署服务后请通过 HTTPS 访问管理页面（例如 https://${ip}:8000，或经反向代理）。
 
 ## 后端配置
-在打包前需要对项目的application.properties文件进行配置，
+在打包前需要对项目的application.properties文件进行配置。为避免把示例密钥带进生产，服务启动时会校验以下敏感项，未通过则拒绝启动：
 ```
-im.admin_url=http://192.168.1.81:18080
-im.admin_secret=123456
+im.admin_url=https://192.168.1.81:18080
+im.admin_secret=${IM_ADMIN_SECRET}
 ```
-上面是IM服务的管理内网地址和密钥，需要配置正确。
+上面是IM服务的管理内网地址和密钥，需要配置正确；密钥不要使用示例值。
 
 ```
-bridge.my_domain_id=wildfirechat.cn
+bridge.my_domain_id=${BRIDGE_MY_DOMAIN_ID}
 ```
 上面这个是每个域的域ID，需要保证在整个mesh网络内唯一，且不能太长，建议用域名或者实体简称。
 
-剩下的就是数据库了，需要手动创建数据库，使用命令```create database bridge;```创建数据库。服务使用了JPS会自动创建表，当首次启动后再执行resource目录下的data.sql创建默认管理员账户和密码.
+剩下的就是数据库了，需要手动创建数据库，使用命令```create database bridge;```创建数据库。服务使用 JPA 自动创建表。管理员账户不再使用固定默认密码，而是在首次启动时根据环境变量 `BRIDGE_ADMIN_INIT_PASSWORD` 创建（至少 8 位）；创建成功后请删除该环境变量并尽快修改密码。
 
 ## 后端编译
 在前端编译成功和后端配置之后，在项目目录下执行:
@@ -67,14 +67,28 @@ nohup java -jar XXXX.jar 2>&1 &
 桥接服务要联通内外，所以防火墙需要设置。首先是IM服务和桥接服务内网互通，IM服务会调用桥接服务的8100端口（配置文件中的server.internalPort)，桥接服务会调用IM服务的18080端口。另外桥接服务还开放一个管理端口8000，可以让管理员上去操作配置与其他域的连接。还有桥接服务开放API端口8200供其他桥接服务连接。
 
 总结一下：
-1. 桥接服务入访的端口有3个，8100供IM服务内网调用，8000供管理员调用，8200供其他域的桥接服务调用。因此8100是只能内网访问或者只能IM所在服务器访问，8000配置被允许访问的地址仅限于管理员所在IP段访问，8200配置开放访问或者限制来源于其他域的访问。
+1. 桥接服务入访的端口有3个，8100供IM服务内网调用，8000供管理员调用，8200供其他域的桥接服务调用。因此8100是只能内网访问或者只能IM所在服务器访问，8000配置被允许访问的地址仅限于管理员所在IP段访问；**8200不要对任意公网开放，应只对已互联的对方域桥接服务地址做白名单放行**（按对方出口 IP/网段，或对方域名解析后的地址配置），其他来源默认拒绝。
 2. 桥接服务的出访地址有2个，桥接服务会内网访问IM服务的18080端口，另外一个是桥接服务会外网访问其他桥接服务。也请做好防火墙处理。
+
+## 安全基线（部署前必须确认）
+
+1. **只通过防火墙开放必要端口**：8100 仅允许 IM 服务所在主机访问，8000 仅允许办公网/运维网访问，**8200 仅对已互联的对方域桥接服务地址做白名单放行**，不要对任意公网开放。服务端不再依赖“端口即安全边界”，但仍建议在 Connector 或防火墙上绑定明确地址。
+2. **全链路 HTTPS**：对端 `Domain.url` 默认必须是 `https://`；本地调试确需 HTTP 时，才临时设置 `bridge.allow_http_domains=true`，生产环境不要打开。
+3. **敏感配置全部用环境变量注入**：`IM_ADMIN_SECRET`、`DB_PASSWORD`、`MINIO_ACCESS_KEY`、`MINIO_SECRET_KEY`、`BRIDGE_MY_DOMAIN_ID`、`BRIDGE_ADMIN_INIT_PASSWORD`。不要使用仓库中的示例值。
+4. **对端 API 使用 HMAC-SHA256 全请求签名**：签名覆盖 method、path、query、content-length、body hash、content-type、业务头、域 ID、timestamp、nonce；时间窗双向 5 分钟，nonce 会去重。该签名与旧版本不兼容，升级时所有域需要同步升级。
+5. **管理后台**：`/admin/**` 中的域管理操作需要 `user:admin` 权限；普通 `user` 只能查看账号和改自己的密码。默认不启用 CORS；如前后端分离部署，配置 `bridge.cors_allowed_origins` 精确白名单。
+6. **会话**：只接受 `authToken` 请求头，不使用 Cookie/URL 重写；默认 60 分钟超时，改密后旧会话失效。多实例部署时请把 `NonceCache` 替换为 Redis 等共享存储。
+7. **媒体下载**：`bridge.media_download_host_whitelist` 为空时只允许本域 `media.bucket_*_domain`；对端传来的任意媒体地址默认拒绝。不要为了图方便把白名单配成 `*`，也不要把私网地址加入白名单，除非你明确知道风险。
 
 ## IM服务配置
 在2024年6.30之后发布的版本中才支持Mesh功能，在配置文件中找到配置```mesh.callback```，把配置打开并修改成桥接服务的地址，比如```http://${桥接服务的内网IP}:8100/internal```。配置之后需要重启IM服务。
 
 ## 登录
-桥接服务启动后，用浏览器打开地址http://${ip}:8000就可以打开后台登陆页面，默认账户/密码为 ```admin/admin123```  登陆以后注意修改默认密码。（如果提示用户不存在，可能是上面提到的data.sql没有被执行，请执行上面的sql脚本添加管理员）。
+桥接服务启动后，用浏览器打开管理地址（生产环境请通过 HTTPS 反向代理访问 8000 端口）。首次启动前设置：
+```
+export BRIDGE_ADMIN_INIT_PASSWORD='一个足够强的初始密码'
+```
+服务会创建 `admin` 账户。登录后请立即修改密码；修改密码会使该账号已有会话全部失效。
 
 ## 管理域
 在管理后台可以添加/查看/删除域。当添加域时，需要填入对方的域ID和域密钥，如果对方域密钥暂时没有，可以先添加等待对方添加生成之后再修改。添加成功后可以得到这个连接中的自己的密钥，需要把自己的域ID和这个域密钥告诉对方进行添加。双方都正确添加域后才可以互通。
@@ -131,7 +145,8 @@ nohup java -jar XXXX.jar 2>&1 &
 * `media.bucket_<type>_name` / `media.bucket_<type>_domain`：按 mediaType 区分的桶名和对外访问地址（网关/CDN），`type` 取值 `general/image/voice/video/file/portrait/favorite/sticker/moments`。`domain` 必须能直接访问到对应桶里的对象，否则对端会拿不到文件。
 * `bridge.file_transfer_max_size_mb`：单文件大小上限（MB），`0` 表示不限制。
 * `bridge.file_transfer_threads`：并发传输线程数，使用有界队列。
-* `bridge.media_download_host_whitelist`：允许下载的媒体地址主机白名单（逗号分隔），为空表示不限制主机（始终只允许 http/https）。
+* `bridge.media_download_host_whitelist`：允许下载的媒体地址主机白名单（逗号分隔）。为空时只允许本域 `media.bucket_*_domain` 中配置的桶地址；对端传来的任意媒体地址默认拒绝，防止 SSRF。
+* `bridge.media_download_allow_private_hosts`：是否允许从私网地址下载媒体，默认 `false`；只有明确信任目标内网媒体网关时才打开。
 
 ## 音视频通话
 野火的音视频有2个，一个是免费版本的，另外一个是高级版。这两个版本是不能互通的。所有如果需要音视频通话，那么所有的域都要使用相同的音视频。在使用免费版本音视频时，需要有turn服务可以供双方访问。在使用高级版音视频时，需要janus服务可以被双方访问，或者添加部署能被对方访问的turn服务作为中继。

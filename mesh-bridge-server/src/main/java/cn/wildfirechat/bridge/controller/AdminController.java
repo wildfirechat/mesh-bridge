@@ -1,23 +1,20 @@
 package cn.wildfirechat.bridge.controller;
 
-import cn.wildfirechat.bridge.jpa.Domain;
 import cn.wildfirechat.bridge.model.PojoDomainId;
+import cn.wildfirechat.bridge.pojo.DomainRequest;
 import cn.wildfirechat.bridge.pojo.LoginRequest;
 import cn.wildfirechat.bridge.pojo.UpdatePasswordRequest;
 import cn.wildfirechat.bridge.service.AdminService;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
 @RestController
 @RequestMapping("/admin")
 public class AdminController {
-    private static final Logger LOG = LoggerFactory.getLogger(AdminController.class);
-
     @Autowired
     AdminService adminService;
 
@@ -26,25 +23,21 @@ public class AdminController {
         return "Hello from admin controller";
     }
 
-    /*
-    管理后台登陆
-     */
     @PostMapping(value = "login", produces = "application/json;charset=UTF-8")
-    public Object login(@RequestBody LoginRequest request, HttpServletResponse response) {
-        return adminService.login(response, request.getAccount(), request.getPassword());
+    public Object login(@RequestBody LoginRequest request, HttpServletRequest httpRequest, HttpServletResponse response) {
+        return adminService.login(response, request.getAccount(), request.getPassword(), httpRequest.getRemoteAddr());
     }
 
-    /*
-    管理后台修改密码
-     */
+    @PostMapping(value = "logout", produces = "application/json;charset=UTF-8")
+    public Object logout() {
+        return adminService.logout();
+    }
+
     @PostMapping(value = "update_pwd", produces = "application/json;charset=UTF-8")
     public Object updatePwd(@RequestBody UpdatePasswordRequest request) {
         return adminService.updatePassword(request.oldPassword, request.newPassword);
     }
 
-    /*
-    获取当前用户ID，管理后台和客户端都可以使用
-     */
     @PostMapping(value = "account", produces = "application/json;charset=UTF-8")
     public Object getAccount() {
         return adminService.getAccount();
@@ -52,13 +45,13 @@ public class AdminController {
 
     @Transactional
     @PostMapping(value = "/create_domain", produces = "application/json;charset=UTF-8")
-    public Object createDomain(@RequestBody Domain domain) throws Exception {
+    public Object createDomain(@RequestBody DomainRequest domain) throws Exception {
         return adminService.createDomain(domain);
     }
 
     @Transactional
     @PostMapping(value = "/update_domain", produces = "application/json;charset=UTF-8")
-    public Object updateDomain(@RequestBody Domain domain) throws Exception {
+    public Object updateDomain(@RequestBody DomainRequest domain) throws Exception {
         return adminService.updateDomain(domain);
     }
 

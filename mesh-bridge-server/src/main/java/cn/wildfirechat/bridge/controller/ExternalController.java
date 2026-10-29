@@ -1,5 +1,6 @@
 package cn.wildfirechat.bridge.controller;
 
+import cn.wildfirechat.bridge.multiport.InternalEndpointsFilter;
 import cn.wildfirechat.bridge.service.InService;
 import cn.wildfirechat.pojos.mesh.*;
 import org.slf4j.Logger;
@@ -75,7 +76,8 @@ public class ExternalController {
                 LOG.error("invalid x-media-type header: {}", mediaTypeHeader);
             }
         }
-        return inService.onTransferFileRequest(request.getHeader("x-domain-id"), request.getInputStream(), request.getHeader("x-file-extension"), request.getContentType(), mediaType, request.getContentLengthLong());
+        String domainId = (String) request.getAttribute(InternalEndpointsFilter.AUTHENTICATED_DOMAIN_ATTRIBUTE);
+        return inService.onTransferFileRequest(domainId, request.getInputStream(), request.getHeader("x-file-extension"), request.getContentType(), mediaType, request.getContentLengthLong());
     }
 
     @PostMapping(value = "/batch_user_infos", produces = "application/json;charset=UTF-8")
@@ -130,8 +132,9 @@ public class ExternalController {
 
 
     @PostMapping(value = "/group_updated", produces = "application/json;charset=UTF-8")
-    public Object groupUpdated(@RequestBody PojoGroupUpdated pojoGroupUpdated) {
-        return inService.groupUpdated(pojoGroupUpdated.domainIds.get(0), pojoGroupUpdated.groupInfo, pojoGroupUpdated.members);
+    public Object groupUpdated(@RequestBody PojoGroupUpdated pojoGroupUpdated, HttpServletRequest request) {
+        String domainId = (String) request.getAttribute(InternalEndpointsFilter.AUTHENTICATED_DOMAIN_ATTRIBUTE);
+        return inService.groupUpdated(domainId, pojoGroupUpdated.groupInfo, pojoGroupUpdated.members);
     }
 
     @PostMapping(value = "/conference_request", produces = "application/json;charset=UTF-8")

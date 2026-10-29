@@ -7,6 +7,7 @@ import cn.wildfirechat.bridge.jpa.InMessageIdsKey;
 import cn.wildfirechat.bridge.jpa.InMessageIdsRepository;
 import cn.wildfirechat.bridge.jpa.OutMessageIds;
 import cn.wildfirechat.bridge.jpa.OutMessageIdsRepository;
+import cn.wildfirechat.bridge.utilis.DomainIdUtils;
 import cn.wildfirechat.bridge.utilis.LimitedInputStream;
 import cn.wildfirechat.pojos.*;
 import cn.wildfirechat.pojos.mesh.*;
@@ -33,6 +34,7 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.context.request.async.DeferredResult;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -42,8 +44,14 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 public class InService {
@@ -72,15 +80,160 @@ public class InService {
 
     private final Object bucketLock = new Object();
 
+    @Value("${bridge.my_domain_id}")
+    String myDomainId;
+
+    @Value("${bridge.api_threads:32}")
+    int apiThreads;
+
+    @Value("${bridge.api_queue:1000}")
+    int apiQueue;
+
+    ExecutorService apiExecutor;
+
     //这些类型可能被浏览器当作脚本执行，不能按对端声明的类型保存
     private static final Set<String> UNSAFE_CONTENT_TYPES = new HashSet<>(Arrays.asList(
         "text/html", "application/xhtml+xml", "image/svg+xml",
-        "text/javascript", "application/javascript", "application/x-javascript"
+        "text/javascript", "application/javascript", "application/x-javascript",
+        "application/xml", "text/xml", "text/css"
     ));
 
     @PostConstruct
     void init() {
         minioClient = MinioClient.builder().endpoint(minioEndpoint).credentials(minioAccessKey, minioSecretKey).build();
+        int threads = apiThreads > 0 ? apiThreads : 32;
+        int queue = apiQueue > 0 ? apiQueue : 1000;
+        AtomicInteger index = new AtomicInteger();
+        ThreadFactory threadFactory = runnable -> {
+            Thread thread = new Thread(runnable, "mesh-api-" + index.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        };
+        apiExecutor = new ThreadPoolExecutor(threads, threads, 60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(queue), threadFactory, new ThreadPoolExecutor.AbortPolicy());
+    }
+
+    @PreDestroy
+    void destroy() {
+        if (apiExecutor != null) {
+            apiExecutor.shutdownNow();
+        }
+    }
+
+    private void runAsync(DeferredResult<String> deferredResult, Runnable task) {
+        try {
+            apiExecutor.execute(() -> {
+                try {
+                    task.run();
+                } catch (IllegalArgumentException e) {
+                    LOG.warn("reject invalid bridge request: {}", e.getMessage());
+                    setError(deferredResult, MeshRestResult.MeshRestCode.ERROR_INVALID_PARAMETER.code, "请求参数不合法");
+                } catch (Throwable t) {
+                    LOG.error("process bridge request failed", t);
+                    setError(deferredResult, MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            LOG.error("bridge api thread pool is full");
+            setError(deferredResult, MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务繁忙，请稍后重试");
+        }
+    }
+
+    private void setError(DeferredResult<String> deferredResult, int code, String message) {
+        if (!deferredResult.isSetOrExpired()) {
+            deferredResult.setResult(MeshRestResult.remoteMeshError(code, message).toString());
+        }
+    }
+
+    private void requireDomainId(String domainId) {
+        if (!StringUtils.hasText(domainId)) {
+            throw new IllegalArgumentException("domainId is empty");
+        }
+    }
+
+    /**
+     * 请求中的发送者/操作者必须是带域的外部 ID，且不能冒充本域用户。
+     * 这阻止了对端把 sender/operator 写成 admin 之类的本地用户 ID。
+     */
+    private String requireExternalActor(String domainId, String id, String field) {
+        requireDomainId(domainId);
+        if (!StringUtils.hasText(id) || !DomainIdUtils.isExternalId(id)) {
+            throw new IllegalArgumentException(field + " must be an external id");
+        }
+        String actorDomain = DomainIdUtils.getExternalId(id);
+        if (myDomainId.equals(actorDomain)) {
+            throw new IllegalArgumentException(field + " must not be a local user");
+        }
+        return id;
+    }
+
+    /**
+     * 直接请求（好友、群操作、会议请求等）要求操作者属于请求方域，不能伪造其他域用户。
+     */
+    private String requireRequesterActor(String domainId, String id, String field) {
+        String actor = requireExternalActor(domainId, id, field);
+        if (!domainId.equals(DomainIdUtils.getExternalId(actor))) {
+            throw new IllegalArgumentException(field + " must belong to the requesting domain");
+        }
+        return actor;
+    }
+
+    /**
+     * 目标/群/成员 ID 允许是本域 ID（去掉 @本域 后缀），也允许是外部 ID；裸 ID 视为本域。
+     */
+    private String normalizeTargetId(String id) {
+        if (!StringUtils.hasText(id) || !DomainIdUtils.isExternalId(id)) {
+            return id;
+        }
+        String domainId = DomainIdUtils.getExternalId(id);
+        if (myDomainId.equals(domainId)) {
+            return DomainIdUtils.toInternalId(myDomainId, id, myDomainId);
+        }
+        return id;
+    }
+
+    private void requireGroupDomain(String domainId, String groupId) {
+        requireDomainId(domainId);
+        if (!StringUtils.hasText(groupId) || !DomainIdUtils.isExternalId(groupId)) {
+            throw new IllegalArgumentException("groupId must be an external id");
+        }
+        String groupDomain = DomainIdUtils.getExternalId(groupId);
+        if (!myDomainId.equals(groupDomain) && !domainId.equals(groupDomain)) {
+            throw new IllegalArgumentException("group does not belong to this domain");
+        }
+    }
+
+    private void requireMessageBelongsToDomain(String domainId, long messageId) {
+        // 请求里的 messageId 是本域消息 ID：要么是本域收到的对端消息（in 表按 local_message_id 反查），
+        // 要么是本域发给对端的消息（out 表按本域 message_id 查）。
+        boolean incoming = inMessageIdsRepository.findByDomainIdAndLocalMessageId(domainId, messageId).isPresent();
+        boolean outgoing = outMessageIdsRepository.findByMessageIdAndToDomainId(messageId, domainId).isPresent();
+        if (!incoming && !outgoing) {
+            throw new IllegalArgumentException("message does not belong to this domain");
+        }
+    }
+
+    private List<String> normalizeTargets(List<String> ids) {
+        if (ids == null) {
+            return null;
+        }
+        List<String> result = new java.util.ArrayList<>(ids.size());
+        for (String id : ids) {
+            result.add(normalizeTargetId(id));
+        }
+        return result;
+    }
+
+    private List<PojoGroupMember> normalizeMembers(List<PojoGroupMember> members) {
+        if (members == null) {
+            return null;
+        }
+        for (PojoGroupMember member : members) {
+            if (member != null) {
+                member.setMember_id(normalizeTargetId(member.getMember_id()));
+            }
+        }
+        return members;
     }
 
     @Autowired
@@ -91,9 +244,10 @@ public class InService {
 
     public Object onPing(String domainId) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
+                requireDomainId(domainId);
                 IMResult<InputOutputDomainInfo> imResult = MeshAdmin.getDomain(domainId);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result.name);
@@ -101,8 +255,8 @@ public class InService {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -111,7 +265,7 @@ public class InService {
 
     public Object onSearchUser(String keyword, int searchType, int userType, int page) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
                 IMResult<PojoSearchUserRes> imResult = MeshAdmin.searchUser(keyword, searchType, userType, page);
@@ -121,8 +275,8 @@ public class InService {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -131,18 +285,20 @@ public class InService {
 
     public Object onAddFriendRequest(String domainId, String fromUserId, String reason, String targetUid) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<Void> imResult = MeshAdmin.sendFriendRequest(fromUserId, targetUid, reason);
+                requireRequesterActor(domainId, fromUserId, "fromUserId");
+                String safeTargetUid = normalizeTargetId(targetUid);
+                IMResult<Void> imResult = MeshAdmin.sendFriendRequest(fromUserId, safeTargetUid, reason);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok();
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -151,18 +307,20 @@ public class InService {
 
     public Object onHandleFriendRequest(String domainId, String fromUserId, int status, String targetUid) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<Void> imResult = MeshAdmin.handleFriendRequest(fromUserId, targetUid, status);
+                requireRequesterActor(domainId, fromUserId, "fromUserId");
+                String safeTargetUid = normalizeTargetId(targetUid);
+                IMResult<Void> imResult = MeshAdmin.handleFriendRequest(fromUserId, safeTargetUid, status);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok();
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -171,18 +329,20 @@ public class InService {
 
     public Object onDeleteFriend(String domainId, String fromUserId, String friendUid) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<Void> imResult = RelationAdmin.setUserFriend(fromUserId, friendUid, false, "");
+                requireRequesterActor(domainId, fromUserId, "fromUserId");
+                String safeFriendUid = normalizeTargetId(friendUid);
+                IMResult<Void> imResult = RelationAdmin.setUserFriend(fromUserId, safeFriendUid, false, "");
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok();
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -191,10 +351,16 @@ public class InService {
 
     public Object onSendMessageRequest(String domainId, long messageId, SendMessageData messageData, String sendClientId) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<SendMessageResult> imResult = MeshAdmin.sendMessage(messageData.getSender(), messageData.getConv(), messageData.getPayload(), messageData.getToUsers());
+                if (messageData == null || messageData.getConv() == null || messageData.getPayload() == null) {
+                    throw new IllegalArgumentException("messageData is empty");
+                }
+                requireRequesterActor(domainId, messageData.getSender(), "sender");
+                messageData.getConv().setTarget(normalizeTargetId(messageData.getConv().getTarget()));
+                List<String> safeToUsers = normalizeTargets(messageData.getToUsers());
+                IMResult<SendMessageResult> imResult = MeshAdmin.sendMessage(messageData.getSender(), messageData.getConv(), messageData.getPayload(), safeToUsers);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     InMessageIdsKey key = new InMessageIdsKey(messageId, domainId);
                     InMessageIds inMessageIds = new InMessageIds();
@@ -207,8 +373,8 @@ public class InService {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -217,9 +383,18 @@ public class InService {
 
     public Object onPublishMessageRequest(String domainId, long messageId, SendMessageData messageData, List<String> receivers, boolean republish) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
+                if (messageData == null || messageData.getConv() == null || messageData.getPayload() == null) {
+                    throw new IllegalArgumentException("messageData is empty");
+                }
+                if (receivers == null || receivers.isEmpty()) {
+                    throw new IllegalArgumentException("receivers is empty");
+                }
+                requireExternalActor(domainId, messageData.getSender(), "sender");
+                messageData.getConv().setTarget(normalizeTargetId(messageData.getConv().getTarget()));
+                List<String> safeReceivers = normalizeTargets(receivers);
                 // republish消息是消息删除/撤回/更正后，重新发送的
                 if(republish) {
                     InMessageIdsKey key = new InMessageIdsKey(messageId, domainId);
@@ -271,7 +446,7 @@ public class InService {
                         //如果是从本域发出的再publish回来的消息，要把媒体地址改成本域里保存的地址，可以参考 convertMessagePayloadDomainId 方法里的对文件消息的处理
                         messageData.getPayload().setRemoteMediaUrl(outMessageOptional.get().mediaUrl);
                     }
-                    IMResult<SendMessageResult> imResult = MeshAdmin.publishMessage(messageData, receivers, outMessageOptional.isPresent()?outMessageOptional.get().messageId:0);
+                    IMResult<SendMessageResult> imResult = MeshAdmin.publishMessage(messageData, safeReceivers, outMessageOptional.isPresent()?outMessageOptional.get().messageId:0);
                     if (imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                         restResult = MeshRestResult.ok(imResult.result);
                         // if ((messageData.getPayload().getPersistFlag() & 0x01) > 0) {
@@ -290,8 +465,8 @@ public class InService {
                     }
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -300,9 +475,11 @@ public class InService {
 
     public Object onRecallMessageRequest(String domainId, long messageId, String operator, boolean isSenderRecall) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
+                requireExternalActor(domainId, operator, "operator");
+                requireMessageBelongsToDomain(domainId, messageId);
                 IMResult<String> imResult = MeshAdmin.recallMessage(operator, messageId);
                 if (imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
@@ -310,8 +487,8 @@ public class InService {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -475,18 +652,22 @@ public class InService {
 
     public Object onBatchGetUserInfoRequest(String domainId, List<String> userIds) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<OutputUserInfoList> imResult = MeshAdmin.getBatchUserInfos(userIds);
+                if (userIds == null || userIds.isEmpty()) {
+                    throw new IllegalArgumentException("userIds is empty");
+                }
+                List<String> safeUserIds = normalizeTargets(userIds);
+                IMResult<OutputUserInfoList> imResult = MeshAdmin.getBatchUserInfos(safeUserIds);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -495,18 +676,25 @@ public class InService {
 
     public Object onBatchGetGroupInfoRequest(String domainId, List<String> groupIds) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<PojoGroupInfoList> imResult = MeshAdmin.batchGroupInfos(groupIds);
+                if (groupIds == null || groupIds.isEmpty()) {
+                    throw new IllegalArgumentException("groupIds is empty");
+                }
+                for (String id : groupIds) {
+                    requireGroupDomain(domainId, id);
+                }
+                List<String> safeGroupIds = normalizeTargets(groupIds);
+                IMResult<PojoGroupInfoList> imResult = MeshAdmin.batchGroupInfos(safeGroupIds);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -515,18 +703,20 @@ public class InService {
 
     public Object getGroupMemberRequest(String domainId, String groupId) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<OutputGroupMemberList> imResult = MeshAdmin.getGroupMembers(groupId);
+                requireGroupDomain(domainId, groupId);
+                String safeGroupId = normalizeTargetId(groupId);
+                IMResult<OutputGroupMemberList> imResult = MeshAdmin.getGroupMembers(safeGroupId);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -536,18 +726,25 @@ public class InService {
 
     public Object addGroupMemberRequest(String domainId, String operator, String groupId, List<PojoGroupMember> members) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<Void> imResult = MeshAdmin.addGroupMembers(operator, groupId, members, null, null);
+                if (members == null || members.isEmpty()) {
+                    throw new IllegalArgumentException("members is empty");
+                }
+                requireRequesterActor(domainId, operator, "operator");
+                requireGroupDomain(domainId, groupId);
+                String safeGroupId = normalizeTargetId(groupId);
+                List<PojoGroupMember> safeMembers = normalizeMembers(members);
+                IMResult<Void> imResult = MeshAdmin.addGroupMembers(operator, safeGroupId, safeMembers, null, null);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -556,18 +753,25 @@ public class InService {
 
     public Object addJoinGroupRequest(String domainId, String operator, String groupId, List<String> userIds, String reason, String extra) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<Void> imResult = MeshAdmin.addJoinGroupRequest(operator, groupId, userIds, reason, extra);
+                if (userIds == null || userIds.isEmpty()) {
+                    throw new IllegalArgumentException("userIds is empty");
+                }
+                requireRequesterActor(domainId, operator, "operator");
+                requireGroupDomain(domainId, groupId);
+                String safeGroupId = normalizeTargetId(groupId);
+                List<String> safeUserIds = normalizeTargets(userIds);
+                IMResult<Void> imResult = MeshAdmin.addJoinGroupRequest(operator, safeGroupId, safeUserIds, reason, extra);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -576,18 +780,21 @@ public class InService {
 
     public Object quitGroupRequest(String domainId, String operator, String groupId) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<Void> imResult = MeshAdmin.quitGroup(operator, groupId, null, null);
+                requireRequesterActor(domainId, operator, "operator");
+                requireGroupDomain(domainId, groupId);
+                String safeGroupId = normalizeTargetId(groupId);
+                IMResult<Void> imResult = MeshAdmin.quitGroup(operator, safeGroupId, null, null);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -596,18 +803,21 @@ public class InService {
 
     public Object dismissGroupRequest(String domainId, String operator, String groupId) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<Void> imResult = MeshAdmin.dismissGroup(operator, groupId, null, null);
+                requireRequesterActor(domainId, operator, "operator");
+                requireGroupDomain(domainId, groupId);
+                String safeGroupId = normalizeTargetId(groupId);
+                IMResult<Void> imResult = MeshAdmin.dismissGroup(operator, safeGroupId, null, null);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -616,18 +826,25 @@ public class InService {
 
     public Object kickoffGroupMemberRequest(String domainId, String operator, String groupId, List<String> members) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<Void> imResult = MeshAdmin.kickoffGroupMembers(operator, groupId, members, null, null);
+                if (members == null || members.isEmpty()) {
+                    throw new IllegalArgumentException("members is empty");
+                }
+                requireRequesterActor(domainId, operator, "operator");
+                requireGroupDomain(domainId, groupId);
+                String safeGroupId = normalizeTargetId(groupId);
+                List<String> safeMembers = normalizeTargets(members);
+                IMResult<Void> imResult = MeshAdmin.kickoffGroupMembers(operator, safeGroupId, safeMembers, null, null);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -636,18 +853,22 @@ public class InService {
 
     public Object transferGroupRequest(String domainId, String operator, String newOwner, String groupId) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<Void> imResult = MeshAdmin.transferGroup(operator, groupId, newOwner, null, null);
+                requireRequesterActor(domainId, operator, "operator");
+                requireGroupDomain(domainId, groupId);
+                String safeGroupId = normalizeTargetId(groupId);
+                String safeNewOwner = normalizeTargetId(newOwner);
+                IMResult<Void> imResult = MeshAdmin.transferGroup(operator, safeGroupId, safeNewOwner, null, null);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -656,18 +877,21 @@ public class InService {
 
     public Object modifyGroupInfoRequest(String domainId, String operator, String groupId, int type, String value) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<Void> imResult = MeshAdmin.modifyGroupInfo(operator, groupId, type, value, null, null);
+                requireRequesterActor(domainId, operator, "operator");
+                requireGroupDomain(domainId, groupId);
+                String safeGroupId = normalizeTargetId(groupId);
+                IMResult<Void> imResult = MeshAdmin.modifyGroupInfo(operator, safeGroupId, type, value, null, null);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -676,18 +900,26 @@ public class InService {
 
     public Object groupUpdated(String domainId, PojoGroupInfo groupInfo, List<PojoGroupMember> members) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                IMResult<Void> imResult = MeshAdmin.syncGroup(groupInfo, members);
+                requireDomainId(domainId);
+                if (groupInfo == null || !DomainIdUtils.isExternalId(groupInfo.getTarget_id())
+                    || !domainId.equals(DomainIdUtils.getExternalId(groupInfo.getTarget_id()))) {
+                    throw new IllegalArgumentException("groupUpdated must target a group owned by the requesting domain");
+                }
+                groupInfo.setTarget_id(normalizeTargetId(groupInfo.getTarget_id()));
+                groupInfo.setOwner(normalizeTargetId(groupInfo.getOwner()));
+                List<PojoGroupMember> safeMembers = normalizeMembers(members);
+                IMResult<Void> imResult = MeshAdmin.syncGroup(groupInfo, safeMembers);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
                 } else {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -696,9 +928,10 @@ public class InService {
 
     public Object conferenceRequest(String domainId, String clientID, String fromUser, String request, long sessionId, String roomId, String data, boolean advanced) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
+                requireRequesterActor(domainId, fromUser, "fromUser");
                 IMResult<PojoUserConferenceResponse> imResult = MeshAdmin.userConferenceRequest(clientID, fromUser, request, sessionId, roomId, data, advanced);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result.data);
@@ -706,8 +939,8 @@ public class InService {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });
@@ -716,9 +949,10 @@ public class InService {
 
     public Object conferenceEvent(String domainId, String data, String userId, String clientId, boolean isRobot) {
         DeferredResult<String> deferredResult = new DeferredResult<>();
-        CompletableFuture.runAsync(()->{
+        runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
+                requireExternalActor(domainId, userId, "userId");
                 IMResult<Void> imResult = MeshAdmin.userConferenceEvent(data, userId, clientId, isRobot);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
@@ -726,8 +960,8 @@ public class InService {
                     restResult = MeshRestResult.remoteIMError(imResult.code, imResult.msg);
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, e.getLocalizedMessage());
+                LOG.error("bridge request failed", e);
+                restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_SERVER_ERROR.code, "服务内部错误");
             }
             deferredResult.setResult(restResult.toString());
         });

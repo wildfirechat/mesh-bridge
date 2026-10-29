@@ -156,6 +156,7 @@ onMounted(() => {
 })
 
 function logout() {
+    store.logout().catch(() => {})
     localStorage.clear()
     router.replace('/login')
 }

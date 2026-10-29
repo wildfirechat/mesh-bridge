@@ -19,7 +19,6 @@ const instance = Axios.create({
 })
 instance.interceptors.request.use((request) => {
     request.headers['authToken'] = localStorage.getItem('authToken')
-    console.log('request', request)
     return request
 })
 
@@ -34,7 +33,7 @@ instance.interceptors.response.use((response) => {
             localStorage.setItem('authToken', authToken)
         }
     } else {
-        if (response.config.url !== '/login' && code === 13) {
+        if (response.config.url !== '/login' && code === 1) {
             localStorage.removeItem('authToken')
             proxy.$message.error('请先登陆')
             proxy.$router.replace('/login')

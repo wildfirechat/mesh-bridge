@@ -12,14 +12,18 @@ import cn.wildfirechat.bridge.jpa.Domain;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import okhttp3.*;
-import org.apache.commons.codec.digest.DigestUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.util.StringUtils;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 
@@ -30,10 +34,23 @@ public class HttpUtils {
 
     public static final Map<String, OkHttpClient> httpClientMap = new ConcurrentHashMap<>();
 
+    private static volatile long responseMaxBytes = 1024 * 1024;
+    private static volatile boolean allowHttpDomains = false;
+
     private static String myDomainId;
 
     public static void setMyDomainId(String myDomainId) {
         HttpUtils.myDomainId = myDomainId;
+    }
+
+    public static void setResponseMaxBytes(long maxBytes) {
+        if (maxBytes > 0) {
+            HttpUtils.responseMaxBytes = maxBytes;
+        }
+    }
+
+    public static void setAllowHttpDomains(boolean allow) {
+        HttpUtils.allowHttpDomains = allow;
     }
 
     public interface HttpCallback {
@@ -41,63 +58,138 @@ public class HttpUtils {
         void onFailure(int statusCode, String errorMessage);
     }
 
-    private static Headers getSignHeaders(Domain domain) {
-        if(!StringUtils.hasText(myDomainId)) {
+    private static String joinUrl(String base, String path) {
+        if (!StringUtils.hasText(base)) {
+            throw new IllegalArgumentException("domain url is empty");
+        }
+        String url = base.trim();
+        while (url.endsWith("/")) {
+            url = url.substring(0, url.length() - 1);
+        }
+        if (!path.startsWith("/")) {
+            path = "/" + path;
+        }
+        String fullUrl = url + path;
+        URI uri = URI.create(fullUrl);
+        String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase();
+        if (!"https".equals(scheme) && !(allowHttpDomains && "http".equals(scheme))) {
+            throw new IllegalArgumentException("peer domain url must use https");
+        }
+        return fullUrl;
+    }
+
+    private static Headers getSignHeaders(Domain domain,
+                                          String method,
+                                          String url,
+                                          byte[] body,
+                                          long contentLength,
+                                          String contentType,
+                                          Map<String, String> extraHeaders) {
+        if (!StringUtils.hasText(myDomainId)) {
             throw new RuntimeException("HttpUtils没有正确初始化，需要设置本方domainId");
         }
-        int nonce = (int)(Math.random() * 100000 + 3);
+        if (domain == null || !StringUtils.hasText(domain.secret)) {
+            throw new RuntimeException("domain secret is empty");
+        }
+
+        String nonce = UUID.randomUUID().toString().replace("-", "");
         long timestamp = System.currentTimeMillis();
-        String str = nonce + "|" + domain.secret + "|" + timestamp;
-        String sign = DigestUtils.sha1Hex(str);
-        Headers headers = new Headers.Builder().add("nonce", nonce+"").add("timestamp", ""+timestamp).add("sign", sign).add("x-domain-id", myDomainId +"").build();
-        return headers;
+
+        URI uri = URI.create(url);
+        String path = uri.getRawPath();
+        if (!StringUtils.hasText(path)) {
+            path = "/";
+        }
+        String query = uri.getRawQuery();
+
+        String mediaType = extraHeaders == null ? "" : extraHeaders.getOrDefault("x-media-type", "");
+        String fileExtension = extraHeaders == null ? "" : extraHeaders.getOrDefault("x-file-extension", "");
+        String bodySha256 = body == null ? "-" : SignatureUtils.sha256Hex(body);
+
+        String canonical = SignatureUtils.canonical(
+            method,
+            path,
+            query,
+            contentLength,
+            bodySha256,
+            contentType,
+            mediaType,
+            fileExtension,
+            myDomainId,
+            timestamp + "",
+            nonce);
+        String sign = SignatureUtils.hmacSha256Hex(domain.secret, canonical);
+
+        Headers.Builder builder = new Headers.Builder()
+            .add("nonce", nonce)
+            .add("timestamp", timestamp + "")
+            .add("sign", sign)
+            .add("x-domain-id", myDomainId);
+        if (extraHeaders != null) {
+            extraHeaders.forEach(builder::add);
+        }
+        return builder.build();
     }
 
     public static void httpPostToDomain(Domain domain, String path, final Object object, final HttpCallback httpCallback) {
         String jsonStr;
-        if(object instanceof String) {
+        if (object instanceof String) {
             jsonStr = (String) object;
         } else {
             jsonStr = gson.toJson(object);
         }
-        String url = domain.url + path;
-        Headers headers = getSignHeaders(domain);
-        OkHttpClient httpClient = httpClientMap.computeIfAbsent(domain.domainId, integer -> new OkHttpClient(new OkHttpClient.Builder().connectTimeout(Duration.ofSeconds(20))));
+        byte[] body = jsonStr.getBytes(StandardCharsets.UTF_8);
+        String url = joinUrl(domain.url, path);
+        Headers headers = getSignHeaders(domain, "POST", url, body, body.length, JSON.toString(), null);
+        OkHttpClient httpClient = httpClientMap.computeIfAbsent(domain.domainId, integer -> new OkHttpClient.Builder()
+            .connectTimeout(Duration.ofSeconds(20))
+            .readTimeout(Duration.ofSeconds(30))
+            .writeTimeout(Duration.ofSeconds(30))
+            .callTimeout(Duration.ofSeconds(60))
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build());
         httpCallbackJsonPost(url, jsonStr, headers, httpCallback, httpClient);
     }
 
     //以流的形式POST文件到对端域，body可以是边下边传的流式RequestBody。文件可能比较大，读写超时单独设置
     public static String httpPostStreamToDomain(Domain domain, String path, Map<String, String> extraHeaders, RequestBody body, int timeoutMinutes) throws IOException {
-        String url = domain.url + path;
-        Headers.Builder headersBuilder = getSignHeaders(domain).newBuilder();
-        if(extraHeaders != null) {
-            extraHeaders.forEach(headersBuilder::add);
-        }
-        OkHttpClient httpClient = httpClientMap.computeIfAbsent(domain.domainId, integer -> new OkHttpClient(new OkHttpClient.Builder().connectTimeout(Duration.ofSeconds(20))))
-            .newBuilder().readTimeout(Duration.ofMinutes(timeoutMinutes)).writeTimeout(Duration.ofMinutes(timeoutMinutes)).build();
+        String url = joinUrl(domain.url, path);
+        String contentType = body.contentType() == null ? "" : body.contentType().toString();
+        long contentLength = body.contentLength();
+        Headers headers = getSignHeaders(domain, "POST", url, null, contentLength, contentType, extraHeaders);
+        OkHttpClient baseClient = httpClientMap.computeIfAbsent(domain.domainId, integer -> new OkHttpClient.Builder()
+            .connectTimeout(Duration.ofSeconds(20))
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build());
+        OkHttpClient httpClient = baseClient.newBuilder()
+            .readTimeout(Duration.ofMinutes(timeoutMinutes))
+            .writeTimeout(Duration.ofMinutes(timeoutMinutes))
+            .callTimeout(Duration.ofMinutes(timeoutMinutes + 1L))
+            .build();
         Request request = new Request.Builder()
             .url(url)
             .post(body)
-            .headers(headersBuilder.build())
+            .headers(headers)
             .build();
         try (Response response = httpClient.newCall(request).execute()) {
-            if(response.code() == 200 && response.body() != null) {
-                return response.body().string();
+            if (response.code() == 200 && response.body() != null) {
+                return readBody(response.body());
             }
             throw new IOException("POST to " + url + " failure, status code:" + response.code());
         }
     }
 
     private static void httpCallbackJsonPost(final String url, final String jsonStr, final Headers headers, final HttpCallback httpCallback, final OkHttpClient client) {
-        //消息推送内容为 {"sender":"uCGUxUaa","senderName":"杨","convType":0,"target":"usq7v7UU","targetName":"鞋子","userId":"usq7v7UU","line":0,"cntType":400,"serverTime":1610590766485,"pushMessageType":1,"pushType":2,"pushContent":"","pushData":"","unReceivedMsg":1,"mentionedType":0,"packageName":"cn.wildfirechat.chat","deviceToken":"AFoieP9P6u6CccIkRK23gRwUJWKqSkdiqnb-6gC1kL7Wv-9XNoEYBPU7VsINU_q8_WTKfafe35qWu7ya7Z-NmgOTX9XVW3A3zd6ilh--quj6ccINXRvVnh8QmI9QQ","isHiddenDetail":false,"language":"zh"}
-        //推送信息只打印前100个字符，防止敏感信息打印到日志中去。
-        LOG.info("POST to {} with data {}...", url, jsonStr.substring(0, Math.min(jsonStr.length(), 100)));
+        //只记录 URL 和长度，避免把消息内容写进日志
+        LOG.info("POST to {} with {} bytes", url, jsonStr == null ? 0 : jsonStr.length());
         if (!StringUtils.hasText(url)) {
             LOG.error("http post failure with empty url");
             return;
         }
 
-        if(httpCallback == null && client.dispatcher().queuedCallsCount() > 100000) {
+        if (httpCallback == null && client.dispatcher().queuedCallsCount() > 100000) {
             LOG.error("Http post queue size exceed! Discord post request....");
             return;
         }
@@ -112,39 +204,56 @@ public class HttpUtils {
         client.newCall(request).enqueue(new Callback() {
             @Override
             public void onFailure(Call call, IOException e) {
-                System.out.println("Http请求回调地址失败，请检查IM服务配置文件中对应的回调地址是否正确");
-                e.printStackTrace();
-                LOG.error("Http请求回调地址失败，请检查IM服务配置文件中对应的回调地址是否正确");
-                LOG.error("POST to {} failed", url);
-                if(httpCallback != null) {
+                LOG.error("POST to {} failed: {}", url, e.getMessage());
+                if (httpCallback != null) {
                     httpCallback.onFailure(-1, e.getMessage());
                 }
             }
 
             @Override
-            public void onResponse(Call call, Response response) throws IOException {
-                LOG.info("POST to {} success with response: {}", url, response.body());
+            public void onResponse(Call call, Response response) {
                 try {
-                    if(httpCallback != null) {
+                    if (httpCallback != null) {
                         int code = response.code();
-                        if(code == 200) {
-                            if(response.body() != null && response.body().contentLength() > 0) {
-                                httpCallback.onSuccess(response.body().string());
-                            } else {
-                                httpCallback.onSuccess(null);
-                            }
+                        if (code == 200) {
+                            String content = response.body() == null ? null : readBody(response.body());
+                            httpCallback.onSuccess(content);
                         } else {
                             httpCallback.onFailure(code, response.message());
                         }
                     }
-
+                } catch (Exception e) {
+                    LOG.error("read response from {} failed: {}", url, e.getMessage());
+                    if (httpCallback != null) {
+                        httpCallback.onFailure(-1, e.getMessage());
+                    }
+                } finally {
                     if (response.body() != null) {
                         response.body().close();
                     }
-                } catch (Exception e) {
-                    e.printStackTrace();
                 }
             }
         });
+    }
+
+    private static String readBody(ResponseBody body) throws IOException {
+        long contentLength = body.contentLength();
+        if (contentLength > responseMaxBytes) {
+            throw new IOException("response body too large: " + contentLength);
+        }
+        try (InputStream input = body.byteStream()) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream(contentLength > 0 ? (int) Math.min(contentLength, 8192) : 256);
+            byte[] buffer = new byte[8192];
+            long total = 0;
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                total += read;
+                if (total > responseMaxBytes) {
+                    throw new IOException("response body too large");
+                }
+                output.write(buffer, 0, read);
+            }
+            return new String(output.toByteArray(), StandardCharsets.UTF_8);
+        }
     }
 }

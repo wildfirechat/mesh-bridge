@@ -1,9 +1,15 @@
 package cn.wildfirechat.bridge.jpa;
 
+import javax.persistence.Column;
+import javax.persistence.Embeddable;
 import java.io.Serializable;
 
+@Embeddable
 public class InMessageIdsKey implements Serializable {
+    @Column(name = "message_id")
     public long messageId;
+
+    @Column(name = "domain_id", length = 64)
     public String domainId;
 
     public InMessageIdsKey() {

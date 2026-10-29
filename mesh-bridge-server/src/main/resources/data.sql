@@ -1,1 +1,2 @@
-insert into t_user (account,mobile,email,role,salt,password_md5) values ('admin', '13900000001','support@wildfirechat.cn', 'admin','97eca746-626c-4df6-8dac-562b89782cb5','vprEAhrRd0kGWKNkkepcWw==');
+-- 管理员账户由 AdminInitializer 在首次启动时根据 BRIDGE_ADMIN_INIT_PASSWORD 创建。
+-- 不再提供固定默认账户。

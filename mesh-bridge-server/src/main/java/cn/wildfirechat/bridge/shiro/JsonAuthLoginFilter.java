@@ -7,6 +7,8 @@ import org.apache.shiro.web.filter.AccessControlFilter;
 import org.apache.shiro.SecurityUtils;
 import org.apache.shiro.subject.Subject;
 import org.apache.shiro.web.servlet.ShiroHttpServletRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.servlet.ServletRequest;
 import javax.servlet.ServletResponse;
@@ -15,6 +17,7 @@ import java.io.IOException;
 import java.io.PrintWriter;
 
 public class JsonAuthLoginFilter extends AccessControlFilter {
+    private static final Logger LOG = LoggerFactory.getLogger(JsonAuthLoginFilter.class);
 
     @Override
     protected boolean isAccessAllowed(ServletRequest request, ServletResponse response, Object mappedValue)
@@ -27,13 +30,8 @@ public class JsonAuthLoginFilter extends AccessControlFilter {
 
         Subject subject = SecurityUtils.getSubject();
 
-        if(null != subject){
-            if(subject.isRemembered()){
-                return Boolean.TRUE;
-            }
-            if(subject.isAuthenticated()){
-                return Boolean.TRUE;
-            }
+        if (subject != null && subject.isAuthenticated()) {
+            return Boolean.TRUE;
         }
 
         return Boolean.FALSE ;
@@ -51,7 +49,7 @@ public class JsonAuthLoginFilter extends AccessControlFilter {
 
             out.write(new Gson().toJson(AdminResult.error(AdminResult.AdminCode.ERROR_NOT_LOGIN)));
         } catch (IOException e) {
-            e.printStackTrace();
+            LOG.warn("write not-login response failed", e);
         } finally {
             if (out != null) {
                 out.close();

@@ -31,7 +31,7 @@
                         <el-input v-model.trim="imDomainInfo.secret" autocomplete="off" placeholder="对方 IM Domain 的 密钥，需要对方创建 IM Domain 之后，才知道"></el-input>
                     </el-form-item>
                     <el-form-item label="对方 IM Bridge 入访url" :label-width="formLabelWidth" prop="url">
-                        <el-input v-model.trim="imDomainInfo.url" autocomplete="off" placeholder="对方 IM Bridge 的地址，默认应当是 http://${对方ip}:8200/api"></el-input>
+                        <el-input v-model.trim="imDomainInfo.url" autocomplete="off" placeholder="对方 IM Bridge 的地址，默认应当是 https://${对方ip}:8200/api"></el-input>
                     </el-form-item>
                     <el-form-item label="对方email" :label-width="formLabelWidth" prop="email">
                         <el-input v-model.trim="imDomainInfo.email" autocomplete="off" placeholder="对方的邮箱地址"></el-input>
@@ -64,13 +64,13 @@
                         <el-input v-model.trim="imDomainInfo.detailInfo" autocomplete="off" placeholder="域的一句话描述"></el-input>
                     </el-form-item>
                     <el-form-item label="对方密钥" :label-width="formLabelWidth" prop="secret">
-                        <el-input v-model.trim="imDomainInfo.secret" autocomplete="off" placeholder="对方 IM Domain 的 密钥"></el-input>
+                        <el-input v-model.trim="imDomainInfo.secret" autocomplete="off" placeholder="留空表示不修改"></el-input>
                     </el-form-item>
                     <el-form-item label="己方密钥" :label-width="formLabelWidth" prop="secret">
                         <el-input disabled v-model.trim="imDomainInfo.mySecret" autocomplete="off" placeholder="己方 IM Domain 的 密钥"></el-input>
                     </el-form-item>
                     <el-form-item label="对方 IM Bridge 入访 url" :label-width="formLabelWidth" prop="url">
-                        <el-input v-model.trim="imDomainInfo.url" autocomplete="off" placeholder="对方 IM Bridge 入访的地址，默认应当是 http://${对方ip}:8200/api"></el-input>
+                        <el-input v-model.trim="imDomainInfo.url" autocomplete="off" placeholder="对方 IM Bridge 入访的地址，默认应当是 https://${对方ip}:8200/api"></el-input>
                     </el-form-item>
                     <el-form-item label="对方email" :label-width="formLabelWidth" prop="email">
                         <el-input v-model.trim="imDomainInfo.email" autocomplete="off" placeholder="对方的邮箱地址"></el-input>
@@ -156,8 +156,8 @@ const createDomain = (formName) => {
         }
     });
 }
-const showIMDomainInfo = (imdomain) => {
-    imDomainInfo.value = imdomain;
+const showIMDomainInfo = async (imdomain) => {
+    imDomainInfo.value = await store.getIMDomain(imdomain.domainId);
     modifyAppDialogVisible.value = true;
 }
 const updateDomain = (formName) => {

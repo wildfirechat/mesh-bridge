@@ -5,15 +5,12 @@ import org.apache.shiro.SecurityUtils;
 import org.apache.shiro.mgt.SecurityManager;
 import org.apache.shiro.spring.web.ShiroFilterFactoryBean;
 import org.apache.shiro.web.mgt.DefaultWebSecurityManager;
-import org.apache.shiro.web.servlet.Cookie;
-import org.apache.shiro.web.servlet.ShiroHttpSession;
-import org.apache.shiro.web.servlet.SimpleCookie;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -23,8 +20,8 @@ public class ShiroConfig {
     @Autowired
     DBSessionDao dbSessionDao;
 
-    @Value("${wfc.all_client_support_ssl}")
-    private boolean All_Client_Support_SSL;
+    @Value("${bridge.session_timeout_minutes:60}")
+    private long sessionTimeoutMinutes;
 
     @Bean(name = "shiroFilter")
     public ShiroFilterFactoryBean shiroFilter(SecurityManager securityManager) {
@@ -41,41 +38,37 @@ public class ShiroConfig {
         filterChainDefinitionMap.put("/assets/*", "anon");
         filterChainDefinitionMap.put("/", "anon");
 
-        // <!-- authc:所有url都必须认证通过才可以访问; anon:所有url都都可以匿名访问-->
         filterChainDefinitionMap.put("/api/**", "anon");
         filterChainDefinitionMap.put("/internal/**", "anon");
         filterChainDefinitionMap.put("/admin/hello", "anon");
         filterChainDefinitionMap.put("/admin/login", "anon");
-        filterChainDefinitionMap.put("/admin/**", "login");
 
+        // 已登录用户都可以查看自己的账号、改自己的密码、注销
+        filterChainDefinitionMap.put("/admin/account", "login");
+        filterChainDefinitionMap.put("/admin/update_pwd", "login");
+        filterChainDefinitionMap.put("/admin/logout", "login");
 
-        //主要这行代码必须放在所有权限设置的最后，不然会导致所有 url 都被拦截 剩余的都需要认证
+        // 域管理属于管理员操作，user 角色不能执行
+        filterChainDefinitionMap.put("/admin/**", "login,perms[user:admin]");
+
         shiroFilterFactoryBean.setFilterChainDefinitionMap(filterChainDefinitionMap);
         shiroFilterFactoryBean.getFilters().put("login", new JsonAuthLoginFilter());
         shiroFilterFactoryBean.getFilters().put("perms", new WfPermissionsAuthorizationFilter());
         return shiroFilterFactoryBean;
-
     }
 
     @Bean
     public SecurityManager securityManager() {
         DefaultWebSecurityManager defaultSecurityManager = new DefaultWebSecurityManager();
-        defaultSecurityManager.setRealms(Arrays.asList(passwordRealm, authCodeRealm));
-        ShiroSessionManager sessionManager = new ShiroSessionManager();
-        sessionManager.setGlobalSessionTimeout(Long.MAX_VALUE);
-        sessionManager.setSessionDAO(dbSessionDao);
+        defaultSecurityManager.setRealms(Collections.singletonList(passwordRealm));
 
-        Cookie cookie = new SimpleCookie(ShiroHttpSession.DEFAULT_SESSION_ID_NAME);
-        if (All_Client_Support_SSL) {
-            cookie.setSameSite(Cookie.SameSiteOptions.NONE);
-            cookie.setSecure(true);
-        } else {
-            cookie.setSameSite(null);
-        }
-        cookie.setMaxAge(Integer.MAX_VALUE);
-        sessionManager.setSessionIdCookie(cookie);
-        sessionManager.setSessionIdCookieEnabled(true);
-        sessionManager.setSessionIdUrlRewritingEnabled(true);
+        ShiroSessionManager sessionManager = new ShiroSessionManager();
+        long timeout = Math.max(1, sessionTimeoutMinutes) * 60L * 1000L;
+        sessionManager.setGlobalSessionTimeout(timeout);
+        sessionManager.setSessionDAO(dbSessionDao);
+        // 只接受 authToken 头，不使用 Cookie/URL 重写，避免 CSRF 和 session id 泄漏
+        sessionManager.setSessionIdCookieEnabled(false);
+        sessionManager.setSessionIdUrlRewritingEnabled(false);
 
         defaultSecurityManager.setSessionManager(sessionManager);
         SecurityUtils.setSecurityManager(defaultSecurityManager);
@@ -84,8 +77,4 @@ public class ShiroConfig {
 
     @Autowired
     private PasswordRealm passwordRealm;
-
-
-    @Autowired
-    private AuthCodeRealm authCodeRealm;
 }

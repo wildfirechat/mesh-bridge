@@ -1,15 +1,19 @@
 package cn.wildfirechat.bridge.lifecycle;
 
+import cn.wildfirechat.bridge.utilis.HttpUtils;
 import cn.wildfirechat.sdk.AdminConfig;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.ApplicationListener;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.PostConstruct;
 
 @Component
 public class StartupEventListener implements ApplicationListener<ApplicationReadyEvent> {
+    private static final Logger LOG = LoggerFactory.getLogger(StartupEventListener.class);
 
     @Value("${im.admin_url}")
     String adminUrl;
@@ -17,15 +21,21 @@ public class StartupEventListener implements ApplicationListener<ApplicationRead
     @Value("${im.admin_secret}")
     String adminSecret;
 
+    @Value("${bridge.http_response_max_bytes:1048576}")
+    long httpResponseMaxBytes;
+
+    @Value("${bridge.allow_http_domains:false}")
+    boolean allowHttpDomains;
+
     @PostConstruct
     void init() {
         AdminConfig.initAdmin(adminUrl, adminSecret);
+        HttpUtils.setResponseMaxBytes(httpResponseMaxBytes);
+        HttpUtils.setAllowHttpDomains(allowHttpDomains);
     }
 
     @Override
     public void onApplicationEvent(ApplicationReadyEvent event) {
-        // 在这里编写你的启动后逻辑
-        System.out.println("应用程序已准备就绪，可以开始执行操作了！");
-        // 例如，你可以访问数据库、启动后台线程、发送通知等。
+        LOG.info("bridge application is ready");
     }
 }

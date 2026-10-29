@@ -35,6 +35,7 @@ import org.springframework.web.context.request.async.DeferredResult;
 import javax.annotation.PostConstruct;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
@@ -74,9 +75,15 @@ public class OutService {
     @Value("${bridge.file_transfer_threads:4}")
     int fileTransferThreads;
 
-    //允许下载的媒体地址主机白名单(逗号分隔)，为空表示不限制主机(仍只允许http/https)
+    //允许下载的媒体地址主机白名单(逗号分隔)。为空时只允许本域配置的 media.bucket_*_domain。
     @Value("${bridge.media_download_host_whitelist:}")
     String mediaDownloadHostWhitelist;
+
+    @Value("${bridge.allow_http_domains:false}")
+    boolean allowHttpDomains;
+
+    @Value("${bridge.media_download_allow_private_hosts:false}")
+    boolean allowPrivateMediaHosts;
 
     @Value("${minio.endpoint}")
     String minioEndpoint;
@@ -113,6 +120,9 @@ public class OutService {
         fileHttpClient = new OkHttpClient.Builder()
             .connectTimeout(Duration.ofSeconds(20))
             .readTimeout(Duration.ofMinutes(fileTransferTimeoutMinutes))
+            .callTimeout(Duration.ofMinutes(fileTransferTimeoutMinutes + 1L))
+            .followRedirects(false)
+            .followSslRedirects(false)
             .build();
         int threads = fileTransferThreads > 0 ? fileTransferThreads : 4;
         AtomicInteger threadIndex = new AtomicInteger();
@@ -747,7 +757,7 @@ public class OutService {
                             meshRestResult.setResult(object.toString());
                         }
                     } catch (JsonSyntaxException e) {
-                        e.printStackTrace();
+                        LOG.warn("invalid recall message response from domain {}", domainId);
                     }
                 }
                 deferredResult.setResult(meshRestResult.toString());
@@ -794,8 +804,12 @@ public class OutService {
         //本域对象存储可能是私有读，如果地址是本域配置的桶地址，先签名出1小时内可读的临时地址再下载
         String downloadUrl = presignLocalMediaUrl(mediaUrl);
         try (Response downloadResponse = fileHttpClient.newCall(new Request.Builder().url(downloadUrl).get().build()).execute()) {
+            if (downloadResponse.isRedirect()) {
+                callback.onFailure(ERROR_SERVER_ERROR.code, "download file redirect is not allowed");
+                return;
+            }
             if(!downloadResponse.isSuccessful() || downloadResponse.body() == null) {
-                callback.onFailure(ERROR_SERVER_ERROR.code, "download file from local media server failure, mediaUrl:" + mediaUrl + ", status code:" + downloadResponse.code());
+                callback.onFailure(ERROR_SERVER_ERROR.code, "download file from local media server failure, status code:" + downloadResponse.code());
                 return;
             }
             final ResponseBody downloadBody = downloadResponse.body();
@@ -891,37 +905,117 @@ public class OutService {
         return mediaUrl;
     }
 
-    //只允许http/https，避免file://等协议；可配置主机白名单进一步收紧，防止被诱导去访问内网其他服务
+    //只允许 http/https，且默认只允许本域媒体桶或显式白名单；拒绝私网/回环/链路本地地址和路径穿越。
     private boolean isAllowedMediaUrl(String mediaUrl) {
-        if(!StringUtils.hasText(mediaUrl)) {
+        if (!StringUtils.hasText(mediaUrl)) {
             return false;
         }
         try {
             URI uri = new URI(mediaUrl);
             String scheme = uri.getScheme();
-            if(scheme == null) {
+            if (scheme == null || uri.getHost() == null || uri.getUserInfo() != null) {
                 return false;
             }
             scheme = scheme.toLowerCase();
-            if(!"http".equals(scheme) && !"https".equals(scheme)) {
+            if (!"http".equals(scheme) && !"https".equals(scheme)) {
+                return false;
+            }
+            String lower = mediaUrl.toLowerCase();
+            if (lower.contains("..") || lower.contains("%2e") || lower.contains("%2f")
+                || lower.contains("%5c") || mediaUrl.contains("\\") || mediaUrl.contains(";")) {
+                return false;
+            }
+            int schemeIndex = lower.indexOf("://");
+            if (schemeIndex < 0 || mediaUrl.substring(schemeIndex + 3).contains("//")) {
+                return false;
+            }
+
+            URI normalized = uri.normalize();
+            String normalizedUrl = normalized.toString();
+            if (isLocalBucketUrl(normalizedUrl)) {
+                return true;
+            }
+
+            if (!"https".equals(scheme) && !(allowHttpDomains && "http".equals(scheme))) {
                 return false;
             }
             String host = uri.getHost();
-            if(!StringUtils.hasText(host)) {
+            if (!isExplicitlyAllowedHost(host)) {
                 return false;
             }
-            if(StringUtils.hasText(mediaDownloadHostWhitelist)) {
-                for (String allowed : mediaDownloadHostWhitelist.split(",")) {
-                    if(host.equalsIgnoreCase(allowed.trim())) {
-                        return true;
-                    }
-                }
+            if (!allowPrivateMediaHosts && isPrivateHost(host)) {
                 return false;
             }
             return true;
-        } catch (URISyntaxException e) {
+        } catch (Exception e) {
             return false;
         }
+    }
+
+    private boolean isLocalBucketUrl(String normalizedUrl) {
+        for (String type : BUCKET_TYPES) {
+            String bucketDomain = environment.getProperty("media.bucket_" + type + "_domain");
+            if (!StringUtils.hasText(bucketDomain)) {
+                continue;
+            }
+            String prefix = StringUtils.trimTrailingCharacter(bucketDomain, '/') + "/";
+            if (normalizedUrl.startsWith(prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isExplicitlyAllowedHost(String host) {
+        if (!StringUtils.hasText(mediaDownloadHostWhitelist)) {
+            return false;
+        }
+        for (String allowed : mediaDownloadHostWhitelist.split(",")) {
+            String value = allowed.trim();
+            if (!StringUtils.hasText(value)) {
+                continue;
+            }
+            // 支持 host 或 host:port 两种写法；这里只比较主机名
+            int colon = value.lastIndexOf(':');
+            if (colon > 0 && value.indexOf(']') < 0) {
+                value = value.substring(0, colon);
+            }
+            if (host.equalsIgnoreCase(value)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isPrivateHost(String host) {
+        try {
+            for (InetAddress address : InetAddress.getAllByName(host)) {
+                if (address.isAnyLocalAddress() || address.isLoopbackAddress()
+                    || address.isLinkLocalAddress() || address.isSiteLocalAddress()
+                    || address.isMulticastAddress() || isUniqueLocalIpv6(address)
+                    || isCarrierGradeNat(address)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    private boolean isUniqueLocalIpv6(InetAddress address) {
+        byte[] bytes = address.getAddress();
+        return bytes.length == 16 && (bytes[0] & 0xfe) == 0xfc;
+    }
+
+    private boolean isCarrierGradeNat(InetAddress address) {
+        byte[] bytes = address.getAddress();
+        if (bytes.length != 4) {
+            return false;
+        }
+        int first = bytes[0] & 0xff;
+        int second = bytes[1] & 0xff;
+        return first == 100 && second >= 64 && second <= 127;
     }
 
     private static String extensionOf(String mediaUrl) {

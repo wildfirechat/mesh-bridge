@@ -19,7 +19,17 @@ export const useMeshBridgeStore = defineStore('meshBridge', {
             return api.login(userName, password)
         },
         updatePassword(oldPassword, newPassword) {
-            return api.updatePassword(oldPassword, newPassword)
+            return api.updatePassword(oldPassword, newPassword).then(res => {
+                // 改密后服务端已注销全部会话，前端不再保留旧 token
+                localStorage.removeItem('authToken')
+                return res
+            })
+        },
+        logout() {
+            return api.logout()
+        },
+        getIMDomain(domainId) {
+            return api.getIMDomain(domainId)
         },
         updateAdminUser(user) {
             // TODO
