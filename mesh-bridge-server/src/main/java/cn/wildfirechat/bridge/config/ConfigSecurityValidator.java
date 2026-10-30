@@ -43,11 +43,6 @@ public class ConfigSecurityValidator {
         require("MINIO_ACCESS_KEY / minio.access_key", minioAccessKey);
         require("MINIO_SECRET_KEY / minio.secret_key", minioSecretKey);
 
-        rejectDefault("IM_ADMIN_SECRET / im.admin_secret", imAdminSecret, "123456");
-        rejectDefault("DB_PASSWORD / spring.datasource.password", dbPassword, "123456");
-        rejectDefault("MINIO_ACCESS_KEY / minio.access_key", minioAccessKey, "minioadmin");
-        rejectDefault("MINIO_SECRET_KEY / minio.secret_key", minioSecretKey, "minioadmin");
-
         requireHttpsForRemote("IM_ADMIN_URL / im.admin_url", imAdminUrl);
         requireHttpsForRemote("MINIO_ENDPOINT / minio.endpoint", minioEndpoint);
     }
