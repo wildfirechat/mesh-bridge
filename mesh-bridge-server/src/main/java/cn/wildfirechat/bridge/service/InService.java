@@ -213,6 +213,52 @@ public class InService {
         }
     }
 
+    /**
+     * 撤回权限：操作者必须是原发送者，或者是该群的群主/管理员。
+     * IM Server API 仍会做最终权限校验，这里是桥接层的 fail-closed 前置校验。
+     */
+    private boolean canRecallMessage(long messageId, String operator) {
+        try {
+            IMResult<OutputMessageData> messageResult = MessageAdmin.getMessage(messageId);
+            if (messageResult.getErrorCode() != ErrorCode.ERROR_CODE_SUCCESS || messageResult.getResult() == null) {
+                return false;
+            }
+            OutputMessageData message = messageResult.getResult();
+            String normalizedOperator = normalizeTargetId(operator);
+            String normalizedSender = normalizeTargetId(message.getSender());
+            if (normalizedOperator != null && normalizedOperator.equals(normalizedSender)) {
+                return true;
+            }
+            if (message.getConv() == null || message.getConv().getType() != ProtoConstants.ConversationType.ConversationType_Group) {
+                return false;
+            }
+            String groupId = normalizeTargetId(message.getConv().getTarget());
+            if (!StringUtils.hasText(groupId)) {
+                return false;
+            }
+            IMResult<OutputGroupMemberList> membersResult = MeshAdmin.getGroupMembers(groupId);
+            if (membersResult.getErrorCode() != ErrorCode.ERROR_CODE_SUCCESS || membersResult.getResult() == null
+                || membersResult.getResult().getMembers() == null) {
+                return false;
+            }
+            for (PojoGroupMember member : membersResult.getResult().getMembers()) {
+                if (member == null) {
+                    continue;
+                }
+                String memberId = normalizeTargetId(member.getMember_id());
+                if (normalizedOperator != null && normalizedOperator.equals(memberId)
+                    && (member.getType() == ProtoConstants.GroupMemberType.GroupMemberType_Owner
+                    || member.getType() == ProtoConstants.GroupMemberType.GroupMemberType_Manager)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Exception e) {
+            LOG.warn("check recall permission failed, messageId={}", messageId, e);
+            return false;
+        }
+    }
+
     private List<String> normalizeTargets(List<String> ids) {
         if (ids == null) {
             return null;
@@ -478,8 +524,13 @@ public class InService {
         runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                requireExternalActor(domainId, operator, "operator");
+                requireRequesterActor(domainId, operator, "operator");
                 requireMessageBelongsToDomain(domainId, messageId);
+                if (!canRecallMessage(messageId, operator)) {
+                    restResult = MeshRestResult.remoteMeshError(MeshRestResult.MeshRestCode.ERROR_NO_RIGHT.code, "无权限撤回该消息");
+                    deferredResult.setResult(restResult.toString());
+                    return;
+                }
                 IMResult<String> imResult = MeshAdmin.recallMessage(operator, messageId);
                 if (imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);
@@ -952,7 +1003,7 @@ public class InService {
         runAsync(deferredResult, () -> {
             MeshRestResult restResult;
             try {
-                requireExternalActor(domainId, userId, "userId");
+                requireRequesterActor(domainId, userId, "userId");
                 IMResult<Void> imResult = MeshAdmin.userConferenceEvent(data, userId, clientId, isRobot);
                 if(imResult.getErrorCode() == ErrorCode.ERROR_CODE_SUCCESS) {
                     restResult = MeshRestResult.ok(imResult.result);

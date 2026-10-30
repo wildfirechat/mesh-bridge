@@ -52,7 +52,7 @@ bridge.my_domain_id=${BRIDGE_MY_DOMAIN_ID}
 剩下的就是数据库了，需要手动创建数据库，使用命令```create database bridge;```创建数据库。服务使用 JPA 自动创建表。管理员账户不再使用固定默认密码，而是在首次启动时根据环境变量 `BRIDGE_ADMIN_INIT_PASSWORD` 创建（至少 8 位）；创建成功后请删除该环境变量并尽快修改密码。
 
 ## 后端编译
-在前端编译成功和后端配置之后，在项目目录下执行:
+需要 JDK 11+（Shiro 2.2.0 的最低要求）。在前端编译成功和后端配置之后，在项目目录下执行:
 ```
 mvn clean package
 ```
