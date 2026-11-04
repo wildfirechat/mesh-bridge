@@ -2,6 +2,7 @@ package cn.wildfirechat.bridge.controller;
 
 import cn.wildfirechat.bridge.multiport.InternalEndpointsFilter;
 import cn.wildfirechat.bridge.service.InService;
+import cn.wildfirechat.bridge.utilis.MediaTransferUtils;
 import cn.wildfirechat.pojos.mesh.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -64,7 +65,8 @@ public class ExternalController {
         return inService.onRecallMessageRequest(recallMessageReq.domainId, recallMessageReq.messageId, recallMessageReq.operator, recallMessageReq.isSenderRecall);
     }
 
-    //接收对端传输过来的文件流，mediaType在x-media-type header中，文件后缀名在x-file-extension header中
+    //接收对端传输过来的文件流，mediaType在x-media-type header中，文件后缀名在x-file-extension header中，
+    //上传方原始地址在x-source-media-url header中(可选，用于接收方建立反向映射)
     @PostMapping(value = "/transfer_file", produces = "application/json;charset=UTF-8")
     public Object transferFile(HttpServletRequest request) throws IOException {
         int mediaType = 0;
@@ -77,7 +79,9 @@ public class ExternalController {
             }
         }
         String domainId = (String) request.getAttribute(InternalEndpointsFilter.AUTHENTICATED_DOMAIN_ATTRIBUTE);
-        return inService.onTransferFileRequest(domainId, request.getInputStream(), request.getHeader("x-file-extension"), request.getContentType(), mediaType, request.getContentLengthLong());
+        return inService.onTransferFileRequest(domainId, request.getInputStream(), request.getHeader("x-file-extension"),
+            request.getContentType(), mediaType, request.getContentLengthLong(),
+            request.getHeader(MediaTransferUtils.SOURCE_MEDIA_URL_HEADER));
     }
 
     @PostMapping(value = "/batch_user_infos", produces = "application/json;charset=UTF-8")

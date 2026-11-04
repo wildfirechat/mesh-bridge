@@ -1,9 +1,11 @@
 package cn.wildfirechat.bridge.service;
 
 import cn.wildfirechat.bridge.jpa.*;
+import cn.wildfirechat.bridge.utilis.CompositeMessageUtils;
 import cn.wildfirechat.bridge.utilis.DomainIdUtils;
 import cn.wildfirechat.bridge.utilis.HttpUtils;
 import cn.wildfirechat.bridge.utilis.LimitedInputStream;
+import cn.wildfirechat.bridge.utilis.MediaTransferUtils;
 import cn.wildfirechat.pojos.*;
 import cn.wildfirechat.pojos.mesh.*;
 import cn.wildfirechat.proto.ProtoConstants;
@@ -33,6 +35,7 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.context.request.async.DeferredResult;
 
 import javax.annotation.PostConstruct;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
@@ -41,6 +44,7 @@ import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
@@ -54,6 +58,9 @@ import static cn.wildfirechat.pojos.mesh.MeshRestResult.MeshRestCode.*;
 @Service
 public class OutService {
     private static final Logger LOG = LoggerFactory.getLogger(OutService.class);
+
+    //uid 批量查询时一次最多带多少个消息ID，避免 in 列表过长
+    private static final int MESSAGE_ID_BATCH_SIZE = 500;
 
     @Value("${bridge.my_domain_id}")
     String myDomainId;
@@ -70,6 +77,11 @@ public class OutService {
     //文件传输的最大文件大小(MB)，0表示不限制
     @Value("${bridge.file_transfer_max_size_mb:100}")
     long fileTransferMaxSizeMb;
+
+    //组合消息大文件(remoteMediaUrl 指向的JSON)的最大大小(MB)，0表示不限制。
+    //组合文件需要整个读进内存解析成JSON再改写，不能沿用普通文件的100MB上限。
+    @Value("${bridge.composite_file_max_size_mb:10}")
+    long compositeFileMaxSizeMb;
 
     //文件传输并发线程数
     @Value("${bridge.file_transfer_threads:4}")
@@ -103,6 +115,9 @@ public class OutService {
 
     //文件传输专用线程池，避免大文件传输长时间占用公共线程池。使用有界队列，队列满时直接失败而不是无限堆积。
     ExecutorService transferFileExecutor;
+
+    @Autowired
+    MediaUrlMappingService mediaUrlMappingService;
 
     @Autowired
     OutMessageIdsRepository outMessageIdsRepository;
@@ -408,27 +423,32 @@ public class OutService {
     }
 
     private long convertMessageUid(String remoteDomainId, String sender, long messageUid) {
-        // 根据发送者能够确定是本域发送的还是其他域发送的。再根据记录找到消息的对应关系，替换为对应域的消息ID
+        Optional<Long> mappedMessageUid = findMappedMessageUid(remoteDomainId, sender, messageUid);
+        if(mappedMessageUid.isPresent()) {
+            return mappedMessageUid.get();
+        }
+        LOG.warn("Convert message uid {} to domain {} failed, no mapping found, sender {}", messageUid, remoteDomainId, sender);
+        return 0;
+    }
+
+    //查找消息在目标域里的消息ID(messageUid)。找不到时返回empty，由调用方决定是置0还是保留原值。
+    private Optional<Long> findMappedMessageUid(String remoteDomainId, String sender, long messageUid) {
+        // 一条本域消息可能发往多个域，每个域的对端消息ID不同，必须带上目标域才能取到正确的映射。
+        // 中继消息(外域用户发到本域、本域再转发到第三个域)在本域里也有发往目标域的记录，所以先查 out_message_ids，
+        // 这样"publish 到第三个域"和"转发回来的消息再发出去"都能取到正确的ID。
+        Optional<OutMessageIds> optionalOutMessageIds = outMessageIdsRepository.findByMessageIdAndToDomainId(messageUid, remoteDomainId);
+        if(optionalOutMessageIds.isPresent()) {
+            return Optional.of(optionalOutMessageIds.get().getToMessageId());
+        }
+        // 收到的消息：in_message_ids 里记录的是(来源域, 来源域消息ID) -> 本域消息ID，
+        // 只有在目标域就是消息来源域(publish 回原域)时，才能用本域消息ID反查出原域消息ID。
         if(DomainIdUtils.isExternalId(sender)) {
-            //收到的消息
             String senderDomainId = DomainIdUtils.getExternalId(sender);
-            Optional<Long> optionalOutMessageIds = inMessageIdsRepository.findByDomainIdAndLocalMessageId(senderDomainId, messageUid);
-            if(optionalOutMessageIds.isPresent()) {
-                return optionalOutMessageIds.get();
-            } else {
-                LOG.error("Convert message uid {} failed. The message is from {} domain", messageUid, senderDomainId);
-                return 0;
-            }
-        } else {
-            //发出去的消息。一条本域消息可能发往多个域，每个域的对端消息ID不同，必须带上目标域才能取到正确的映射
-            Optional<OutMessageIds> optionalOutMessageIds = outMessageIdsRepository.findByMessageIdAndToDomainId(messageUid, remoteDomainId);
-            if(optionalOutMessageIds.isPresent()) {
-                return optionalOutMessageIds.get().getToMessageId();
-            } else {
-                LOG.error("Convert message uid {} failed. The message is from local domain, remoteDomainId {}", messageUid, remoteDomainId);
-                return 0;
+            if(remoteDomainId.equals(senderDomainId)) {
+                return inMessageIdsRepository.findByDomainIdAndLocalMessageId(senderDomainId, messageUid);
             }
         }
+        return Optional.empty();
     }
 
     interface ConvertCallback {
@@ -439,7 +459,16 @@ public class OutService {
     //这里是出去的消息进行转换的地方，消息中包含的用户ID/群组ID/频道ID和消息ID等需要转换为对方视角的ID。
     //理论上所有二开只能局限于这个函数。如果有其他改动容易出问题。如果其他地方需要改动，请给我们提PR或者联系我们修改，确保其他部分保持一致。
     private void convertMessagePayloadDomainId(String remoteDomainId, MessagePayload messagePayload, String localDomainId, boolean isPublish, boolean isPublish2OriganlDomain, ConvertCallback callback) {
-        if(!messagePayload.getMentionedTarget().isEmpty()) {
+        convertMessagePayloadDomainId(remoteDomainId, messagePayload, localDomainId, isPublish, isPublish2OriganlDomain, 0, callback);
+    }
+
+    private void convertMessagePayloadDomainId(String remoteDomainId, MessagePayload messagePayload, String localDomainId, boolean isPublish, boolean isPublish2OriganlDomain, int depth, ConvertCallback callback) {
+        if(depth > CompositeMessageUtils.MAX_NEST_DEPTH) {
+            LOG.error("message nesting is too deep, depth {}, remoteDomainId {}", depth, remoteDomainId);
+            callback.onFailure(ERROR_INVALID_PARAMETER.code);
+            return;
+        }
+        if(messagePayload.getMentionedTarget() != null && !messagePayload.getMentionedTarget().isEmpty()) {
             List<String> converted = new ArrayList<>();
             for (String s : messagePayload.getMentionedTarget()) {
                 converted.add(DomainIdUtils.toExternalId(remoteDomainId, s, localDomainId));
@@ -467,31 +496,30 @@ public class OutService {
             }
         } else if(messagePayload.getType() == 10) {
             messagePayload.setContent(DomainIdUtils.toExternalId(remoteDomainId, messagePayload.getContent(), localDomainId));
-            String jsonStr = new String(Base64.getDecoder().decode(messagePayload.getBase64edData()), StandardCharsets.UTF_8);
-            JsonObject object = (JsonObject) JsonParser.parseString(jsonStr);
-            if(replaceOutString(object, "f", remoteDomainId, localDomainId)) {
+            JsonObject object = decodeJsonPayload(messagePayload.getBase64edData());
+            if(object != null && replaceOutString(object, "f", remoteDomainId, localDomainId)) {
                 messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
             }
         } else if(messagePayload.getType() == 400) {
-            String jsonStr = new String(Base64.getDecoder().decode(messagePayload.getBase64edData()), StandardCharsets.UTF_8);
-            JsonObject object = (JsonObject) JsonParser.parseString(jsonStr);
-            if(replaceStringList(object, "ts", remoteDomainId, localDomainId)) {
+            JsonObject object = decodeJsonPayload(messagePayload.getBase64edData());
+            if(object != null && replaceStringList(object, "ts", remoteDomainId, localDomainId)) {
                 messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
             }
         } else if(messagePayload.getType() == 406) {
-            String jsonStr = new String(Base64.getDecoder().decode(messagePayload.getBase64edData()), StandardCharsets.UTF_8);
-            JsonObject object = (JsonObject) JsonParser.parseString(jsonStr);
-            replaceOutString(object, "initiator", remoteDomainId, localDomainId);
-            replaceStringList(object, "participants", remoteDomainId, localDomainId);
-            if(object.has("existParticipants") && object.get("existParticipants") instanceof JsonArray) {
-                JsonArray existParticipants = (JsonArray) object.get("existParticipants");
-                for (int i = 0; i < existParticipants.size(); i++) {
-                    JsonObject participant = existParticipants.get(i).getAsJsonObject();
-                    String newTarget = DomainIdUtils.toExternalId(remoteDomainId, participant.get("userId").getAsString(), localDomainId);
-                    participant.add("userId", new JsonPrimitive(newTarget));
+            JsonObject object = decodeJsonPayload(messagePayload.getBase64edData());
+            if(object != null) {
+                replaceOutString(object, "initiator", remoteDomainId, localDomainId);
+                replaceStringList(object, "participants", remoteDomainId, localDomainId);
+                if(object.has("existParticipants") && object.get("existParticipants") instanceof JsonArray) {
+                    JsonArray existParticipants = (JsonArray) object.get("existParticipants");
+                    for (int i = 0; i < existParticipants.size(); i++) {
+                        JsonObject participant = existParticipants.get(i).getAsJsonObject();
+                        String newTarget = DomainIdUtils.toExternalId(remoteDomainId, participant.get("userId").getAsString(), localDomainId);
+                        participant.add("userId", new JsonPrimitive(newTarget));
+                    }
                 }
+                messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
             }
-            messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
         }
         //Call ID
         if(messagePayload.getType() >= 400 && messagePayload.getType() <= 407) {
@@ -502,7 +530,9 @@ public class OutService {
         if(messagePayload.getType() == 80 || messagePayload.getType() == 81) {
             String operatorId = messagePayload.getContent();
             String originalSender = operatorId;
-            long messageUid = Long.parseLong(new String(Base64.getDecoder().decode(messagePayload.getBase64edData())));
+            String base64edData = messagePayload.getBase64edData();
+            long messageUid = StringUtils.hasText(base64edData)
+                ? Long.parseLong(new String(Base64.getDecoder().decode(base64edData), StandardCharsets.UTF_8)) : 0;
             boolean isRealSender = false;
             if(!TextUtils.isEmpty(messagePayload.getExtra())) {
                 JsonObject object = (JsonObject) JsonParser.parseString(messagePayload.getExtra());
@@ -526,78 +556,381 @@ public class OutService {
                 //当出现这种情况时，需要升级IM服务，让删除消息带上发送者信息.
                 LOG.error("撤回或删除消息内容，消息体中没有找到发送者。如果消息是对方域用户发送，删除将失败！");
             }
-            long targetMessageUid = convertMessageUid(remoteDomainId, originalSender, messageUid);
-            messagePayload.setBase64edData(Base64.getEncoder().encodeToString(String.valueOf(targetMessageUid).getBytes(StandardCharsets.UTF_8)));
+            if(messageUid > 0) {
+                long targetMessageUid = convertMessageUid(remoteDomainId, originalSender, messageUid);
+                messagePayload.setBase64edData(Base64.getEncoder().encodeToString(String.valueOf(targetMessageUid).getBytes(StandardCharsets.UTF_8)));
+            }
 
             //替换操作者
             messagePayload.setContent(DomainIdUtils.toExternalId(remoteDomainId, messagePayload.getContent(), localDomainId));
+        } else if(CompositeMessageUtils.isComposite(messagePayload)) {
+            convertCompositeMessagePayload(remoteDomainId, messagePayload, localDomainId, isPublish, depth, new ConvertCallback() {
+                @Override
+                public void onSuccess() {
+                    convertMessageMedia(remoteDomainId, messagePayload, localDomainId, isPublish, isPublish2OriganlDomain, depth, callback);
+                }
+
+                @Override
+                public void onFailure(int errorCode) {
+                    callback.onFailure(errorCode);
+                }
+            });
+            return;
         }
 
         if(messagePayload.getType() >= 104 && messagePayload.getType() <= 124) {
-            String jsonStr = new String(Base64.getDecoder().decode(messagePayload.getBase64edData()), StandardCharsets.UTF_8);
-            JsonObject object = (JsonObject) JsonParser.parseString(jsonStr);
-            replaceOutString(object, "o", remoteDomainId, localDomainId);
-            replaceOutString(object, "g", remoteDomainId, localDomainId);
-            switch (messagePayload.getType()) {
-                case 105:  //add group member
-                case 106:  //kickoff group member
-                case 120:  //kickoff group member visible
-                case 117:  //change group manager
-                case 118:  //change group member mute state
-                case 119:  //change group member allow state
-                    replaceStringList(object, "ms", remoteDomainId, localDomainId);
-                    break;
-                case 109:  //transfer group
-                case 111:  //change group member alias
-                case 123:  //change group member extra
-                    replaceOutString(object, "m", remoteDomainId, localDomainId);
-                    break;
-                case 104:  //create group
-                case 107:  //quit group
-                case 121:  //quit group visible
-                case 108:  //dismiss group
-                case 110:  //change group name
-                case 112:  //change group portrait
-                case 113:  //change group mute state
-                case 114:  //change group join state
-                case 115:  //change group member private chat
-                case 116:  //change group searchable
-                case 122:  //change group extra
-                case 124:  //change group setting
-                default:
-                    break;
+            JsonObject object = decodeJsonPayload(messagePayload.getBase64edData());
+            if(object != null) {
+                replaceOutString(object, "o", remoteDomainId, localDomainId);
+                replaceOutString(object, "g", remoteDomainId, localDomainId);
+                switch (messagePayload.getType()) {
+                    case 105:  //add group member
+                    case 106:  //kickoff group member
+                    case 120:  //kickoff group member visible
+                    case 117:  //change group manager
+                    case 118:  //change group member mute state
+                    case 119:  //change group member allow state
+                        replaceStringList(object, "ms", remoteDomainId, localDomainId);
+                        break;
+                    case 109:  //transfer group
+                    case 111:  //change group member alias
+                    case 123:  //change group member extra
+                        replaceOutString(object, "m", remoteDomainId, localDomainId);
+                        break;
+                    case 104:  //create group
+                    case 107:  //quit group
+                    case 121:  //quit group visible
+                    case 108:  //dismiss group
+                    case 110:  //change group name
+                    case 112:  //change group portrait
+                    case 113:  //change group mute state
+                    case 114:  //change group join state
+                    case 115:  //change group member private chat
+                    case 116:  //change group searchable
+                    case 122:  //change group extra
+                    case 124:  //change group setting
+                    default:
+                        break;
+                }
+                messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
             }
-            messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
         }
 
-        //如果本域的对象存储服务无法让其他域的用户直接访问，这里需要把文件异步传输到其他域中，且这里修改一下文件的地址。需要新写传输文件的方法。
-        if(!TextUtils.isEmpty(messagePayload.getRemoteMediaUrl())) {
-            // 有2种情况，一种是A domain的用户发送给B domain中的群，那么A域 send message request 到B 域，然后B 域处理
-            // 完本域中的用户后，再publish 到其他域，比如C域，如果有非A域的用户，也会publish到A域。
-            // 另外一种情况是A域中的用户发送到A域中的群，处理完本域内的用户后，再publish 到其他域，比如B域、C域，
-            // 所以就有A send 到B，B再 publish 回A的可能性，isPublish2OriganlDomain就是这种情况(publish的目标域就是消息发送者所在域)，
-            // 这时就不需要再把文件传递到对方域了，需要用对方已经保存的地址。
-            if(isPublish2OriganlDomain) {
-                //忽略，直接用现有地址。对端服务收到后要根据地址找到本方地址。
-            } else {
-                // 发送文件到对方域，发送之后得到对方的域链接，修改这个链接地址后再发送。处理之后再调用callback.onSuccess();通知继续
-                if(!mediaPublicAccessible) {
-                    transferFile(remoteDomainId, messagePayload.getRemoteMediaUrl(), messagePayload.getMediaType(), new TransferFileCallback() {
-                        @Override
-                        public void onSuccess(String remoteMediaUrl) {
-                            messagePayload.setRemoteMediaUrl(remoteMediaUrl);
-                            callback.onSuccess();
-                        }
+        convertMessageMedia(remoteDomainId, messagePayload, localDomainId, isPublish, isPublish2OriganlDomain, depth, callback);
+    }
 
-                        @Override
-                        public void onFailure(int errorCode, String errorMessage) {
-                            LOG.error("transfer file to domain {} failure, mediaUrl {}, error: {}", remoteDomainId, messagePayload.getRemoteMediaUrl(), errorMessage);
-                            callback.onFailure(errorCode);
+    //部分消息类型的扩展数据是可选的(比如组合消息里的通话、群操作通知等子消息)，没有 data 时直接返回 null，避免 NPE
+    private JsonObject decodeJsonPayload(String base64edData) {
+        if(!StringUtils.hasText(base64edData)) {
+            return null;
+        }
+        return JsonParser.parseString(new String(Base64.getDecoder().decode(base64edData), StandardCharsets.UTF_8)).getAsJsonObject();
+    }
+
+    private void convertCompositeMessagePayload(String remoteDomainId, MessagePayload messagePayload, String localDomainId, boolean isPublish, int depth, ConvertCallback callback) {
+        if(!StringUtils.hasText(messagePayload.getBase64edData())) {
+            callback.onSuccess();
+            return;
+        }
+        try {
+            JsonObject composite = CompositeMessageUtils.decode(messagePayload.getBase64edData());
+            convertCompositeMessages(remoteDomainId, CompositeMessageUtils.messages(composite), 0, localDomainId, isPublish, depth, new ConvertCallback() {
+                @Override
+                public void onSuccess() {
+                    messagePayload.setBase64edData(CompositeMessageUtils.encode(composite));
+                    callback.onSuccess();
+                }
+
+                @Override
+                public void onFailure(int errorCode) {
+                    callback.onFailure(errorCode);
+                }
+            });
+        } catch (Exception e) {
+            LOG.error("decode composite message failure", e);
+            callback.onFailure(ERROR_INVALID_PARAMETER.code);
+        }
+    }
+
+    //串行转换组合消息里的子消息。子消息带媒体时需要等待异步传输完成后再处理下一条，
+    //这里用 CompletableFuture 表示"子消息已转换完成"：同步完成时继续当前循环，异步完成时从回调里继续，
+    //避免回调和循环同时推进，也避免用普通布尔变量在跨线程时出现可见性问题。
+    private void convertCompositeMessages(String remoteDomainId, JsonArray messages, int index, String localDomainId, boolean isPublish, int depth, ConvertCallback callback) {
+        if(index == 0) {
+            //先按整层子消息批量转换 uid、预取媒体映射，避免每个子消息都查一次库
+            convertCompositeChildUids(remoteDomainId, messages);
+            prefetchCompositeChildMediaMappings(remoteDomainId, messages);
+        }
+        int currentIndex = index;
+        while(currentIndex < messages.size()) {
+            final JsonObject message;
+            final MessagePayload childPayload;
+            final String originalSender;
+            try {
+                JsonElement element = messages.get(currentIndex);
+                if(!element.isJsonObject()) {
+                    throw new IllegalArgumentException("composite child message is not a json object");
+                }
+                message = element.getAsJsonObject();
+                //uid 已在整层批量转换过，这里只需要 from 用来判断是否发回原域
+                originalSender = CompositeMessageUtils.getString(message, "from");
+                replaceOutString(message, "target", remoteDomainId, localDomainId);
+                replaceOutString(message, "from", remoteDomainId, localDomainId);
+                //接收者字段各端写法不一致：安卓编码写 tos、解码读 toUsers，web 端 tos 可能是字符串，这里都兼容一下
+                replaceStringList(message, "tos", remoteDomainId, localDomainId);
+                replaceOutString(message, "tos", remoteDomainId, localDomainId);
+                replaceStringList(message, "toUsers", remoteDomainId, localDomainId);
+                replaceOutString(message, "toUsers", remoteDomainId, localDomainId);
+                childPayload = CompositeMessageUtils.toPayload(message);
+            } catch (Exception e) {
+                LOG.error("decode composite child message failure, index {}", currentIndex, e);
+                callback.onFailure(ERROR_INVALID_PARAMETER.code);
+                return;
+            }
+
+            boolean childPublish2OriginalDomain = isPublish && DomainIdUtils.isExternalId(originalSender)
+                && remoteDomainId.equals(DomainIdUtils.getExternalId(originalSender));
+
+            final CompletableFuture<Integer> converted;
+            try {
+                converted = convertCompositeChildPayload(remoteDomainId, childPayload, localDomainId, isPublish, childPublish2OriginalDomain, depth + 1)
+                    .thenApply(errorCode -> {
+                        if(errorCode == 0) {
+                            CompositeMessageUtils.updatePayload(message, childPayload);
                         }
+                        return errorCode;
                     });
-                    return;
+            } catch (Exception e) {
+                LOG.error("convert composite child message failure, index {}", currentIndex, e);
+                callback.onFailure(ERROR_INVALID_PARAMETER.code);
+                return;
+            }
+
+            if(!converted.isDone()) {
+                final int nextIndex = currentIndex + 1;
+                final int convertingIndex = currentIndex;
+                converted.whenComplete((errorCode, throwable) -> {
+                    if(throwable != null) {
+                        LOG.error("encode composite child message failure, index {}", convertingIndex, throwable);
+                        callback.onFailure(ERROR_INVALID_PARAMETER.code);
+                        return;
+                    }
+                    if(errorCode == null || errorCode != 0) {
+                        callback.onFailure(errorCode == null ? ERROR_INVALID_PARAMETER.code : errorCode);
+                        return;
+                    }
+                    //这个回调里抛出的异常不会有人处理，必须自己兜住，否则消息会一直挂到超时
+                    try {
+                        convertCompositeMessages(remoteDomainId, messages, nextIndex, localDomainId, isPublish, depth, callback);
+                    } catch (Exception e) {
+                        LOG.error("continue composite message conversion failure, index {}", nextIndex, e);
+                        callback.onFailure(ERROR_INVALID_PARAMETER.code);
+                    }
+                });
+                return;
+            }
+            if(converted.isCompletedExceptionally()) {
+                LOG.error("encode composite child message failure, index {}", currentIndex);
+                callback.onFailure(ERROR_INVALID_PARAMETER.code);
+                return;
+            }
+            Integer errorCode = converted.join();
+            if(errorCode == null || errorCode != 0) {
+                callback.onFailure(errorCode == null ? ERROR_INVALID_PARAMETER.code : errorCode);
+                return;
+            }
+            currentIndex++;
+        }
+        callback.onSuccess();
+    }
+
+    //转换单个子消息，正常完成返回0，失败返回错误码。用 CompletableFuture 表达完成状态，调用方据此决定是继续循环还是等回调。
+    private CompletableFuture<Integer> convertCompositeChildPayload(String remoteDomainId, MessagePayload childPayload, String localDomainId, boolean isPublish, boolean isPublish2OriganlDomain, int depth) {
+        CompletableFuture<Integer> future = new CompletableFuture<>();
+        convertMessagePayloadDomainId(remoteDomainId, childPayload, localDomainId, isPublish, isPublish2OriganlDomain, depth, new ConvertCallback() {
+            @Override
+            public void onSuccess() {
+                future.complete(0);
+            }
+
+            @Override
+            public void onFailure(int errorCode) {
+                future.complete(errorCode);
+            }
+        });
+        return future;
+    }
+
+    //整层子消息的 uid 一起转换：一次批量查询代替每个子消息各查一次。
+    //批量查询失败时退化成逐条查询，保证功能不受影响。
+    private void convertCompositeChildUids(String remoteDomainId, JsonArray messages) {
+        Set<Long> allUids = new HashSet<>();
+        Set<Long> originUids = new HashSet<>();
+        for (JsonElement element : messages) {
+            if(!element.isJsonObject()) {
+                continue;
+            }
+            JsonObject message = element.getAsJsonObject();
+            long uid = CompositeMessageUtils.getLong(message, "uid");
+            if(uid <= 0) {
+                continue;
+            }
+            allUids.add(uid);
+            String sender = CompositeMessageUtils.getString(message, "from");
+            if(DomainIdUtils.isExternalId(sender) && remoteDomainId.equals(DomainIdUtils.getExternalId(sender))) {
+                originUids.add(uid);
+            }
+        }
+        if(allUids.isEmpty()) {
+            return;
+        }
+
+        Map<Long, Long> outMappings = null;
+        Map<Long, Long> inMappings = null;
+        try {
+            outMappings = new HashMap<>();
+            for (List<Long> chunk : partitionMessageIds(allUids)) {
+                for (OutMessageIds mapping : outMessageIdsRepository.findByMessageIds(remoteDomainId, chunk)) {
+                    outMappings.put(mapping.messageId, mapping.toMessageId);
                 }
             }
+            if(!originUids.isEmpty()) {
+                inMappings = new HashMap<>();
+                for (List<Long> chunk : partitionMessageIds(originUids)) {
+                    for (InMessageIds mapping : inMessageIdsRepository.findByLocalMessageIds(remoteDomainId, chunk)) {
+                        inMappings.put(mapping.localMessageId, mapping.id.messageId);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOG.warn("batch query composite child message ids failed, fallback to per-message query", e);
+            outMappings = null;
+            inMappings = null;
+        }
+
+        for (JsonElement element : messages) {
+            if(!element.isJsonObject()) {
+                continue;
+            }
+            JsonObject message = element.getAsJsonObject();
+            long uid = CompositeMessageUtils.getLong(message, "uid");
+            if(uid <= 0) {
+                continue;
+            }
+            String sender = CompositeMessageUtils.getString(message, "from");
+            if(outMappings == null) {
+                convertCompositeChildUid(remoteDomainId, message, sender);
+                continue;
+            }
+            Long mappedUid = outMappings.get(uid);
+            if(mappedUid == null && inMappings != null && DomainIdUtils.isExternalId(sender)
+                && remoteDomainId.equals(DomainIdUtils.getExternalId(sender))) {
+                mappedUid = inMappings.get(uid);
+            }
+            if(mappedUid != null && mappedUid > 0) {
+                if(mappedUid != uid) {
+                    message.addProperty("uid", mappedUid);
+                }
+            } else {
+                //找不到映射时置0(表示目标域未知)，避免把别的域的uid当成本域uid使用
+                LOG.debug("composite child message uid {} has no mapping to domain {}, set to 0", uid, remoteDomainId);
+                message.addProperty("uid", 0);
+            }
+        }
+    }
+
+    //整层子消息的媒体映射一起预取，后面 transferFile 直接命中缓存，不再逐个查库
+    private void prefetchCompositeChildMediaMappings(String remoteDomainId, JsonArray messages) {
+        Set<String> mediaUrls = new HashSet<>();
+        for (JsonElement element : messages) {
+            if(!element.isJsonObject()) {
+                continue;
+            }
+            String mediaUrl = CompositeMessageUtils.getString(element.getAsJsonObject(), "mru");
+            if(StringUtils.hasText(mediaUrl)) {
+                mediaUrls.add(mediaUrl);
+            }
+        }
+        if(!mediaUrls.isEmpty()) {
+            mediaUrlMappingService.prefetchRemoteMediaUrls(remoteDomainId, mediaUrls);
+        }
+    }
+
+    private static List<List<Long>> partitionMessageIds(Collection<Long> messageIds) {
+        List<List<Long>> chunks = new ArrayList<>();
+        List<Long> current = new ArrayList<>(MESSAGE_ID_BATCH_SIZE);
+        for (Long messageId : messageIds) {
+            current.add(messageId);
+            if(current.size() >= MESSAGE_ID_BATCH_SIZE) {
+                chunks.add(current);
+                current = new ArrayList<>(MESSAGE_ID_BATCH_SIZE);
+            }
+        }
+        if(!current.isEmpty()) {
+            chunks.add(current);
+        }
+        return chunks;
+    }
+
+    private void convertCompositeChildUid(String remoteDomainId, JsonObject message, String originalSender) {
+        long uid = CompositeMessageUtils.getLong(message, "uid");
+        if(uid <= 0) {
+            return;
+        }
+        Optional<Long> mappedUid = findMappedMessageUid(remoteDomainId, originalSender, uid);
+        if(!mappedUid.isPresent() || mappedUid.get() <= 0) {
+            //找不到映射时置0(表示目标域未知)。不能保留原值：这个uid可能来自别的域，
+            //以后本域再把它当成本域uid去查 out_message_ids 时会误命中，改写成错误的消息ID。
+            LOG.debug("composite child message uid {} has no mapping to domain {}, set to 0", uid, remoteDomainId);
+            message.addProperty("uid", 0);
+            return;
+        }
+        if(mappedUid.get() != uid) {
+            message.addProperty("uid", mappedUid.get());
+        }
+    }
+
+    //如果本域的对象存储服务无法让其他域的用户直接访问，需要把文件异步传输到对方域，并把地址改成对方域返回的地址。
+    //有2种情况：一种是A域用户发给B域的群，A send 到 B，B处理完本域用户后再publish到C域(有非A域用户时也会publish回A)；
+    //另一种是A域用户发到A域的群，处理完本域用户后再publish到B、C域。所以存在"A send 到B、B再publish回A"的情况，
+    //此时目标域就是消息发送者所在域(isPublish2OriganlDomain)，不需要再传文件，直接用对方已经保存的地址，对端收到后按映射换回本域地址。
+    private void convertMessageMedia(String remoteDomainId, MessagePayload messagePayload, String localDomainId, boolean isPublish, boolean isPublish2OriganlDomain, int depth, ConvertCallback callback) {
+        if(TextUtils.isEmpty(messagePayload.getRemoteMediaUrl()) || isPublish2OriganlDomain) {
+            callback.onSuccess();
+            return;
+        }
+        if(CompositeMessageUtils.isComposite(messagePayload)) {
+            //组合消息的大文件里存的是完整子消息列表，必须下载下来转换后重新上传，不能像普通文件那样只改地址。
+            transferCompositeFile(remoteDomainId, messagePayload.getRemoteMediaUrl(), messagePayload.getMediaType(), localDomainId, isPublish, depth, new TransferFileCallback() {
+                @Override
+                public void onSuccess(String remoteMediaUrl) {
+                    messagePayload.setRemoteMediaUrl(remoteMediaUrl);
+                    callback.onSuccess();
+                }
+
+                @Override
+                public void onFailure(int errorCode, String errorMessage) {
+                    LOG.error("transfer composite file to domain {} failure, mediaUrl {}, error: {}", remoteDomainId, messagePayload.getRemoteMediaUrl(), errorMessage);
+                    callback.onFailure(errorCode);
+                }
+            });
+            return;
+        }
+        if(!mediaPublicAccessible) {
+            transferFile(remoteDomainId, messagePayload.getRemoteMediaUrl(), messagePayload.getMediaType(), new TransferFileCallback() {
+                @Override
+                public void onSuccess(String remoteMediaUrl) {
+                    messagePayload.setRemoteMediaUrl(remoteMediaUrl);
+                    callback.onSuccess();
+                }
+
+                @Override
+                public void onFailure(int errorCode, String errorMessage) {
+                    LOG.error("transfer file to domain {} failure, mediaUrl {}, error: {}", remoteDomainId, messagePayload.getRemoteMediaUrl(), errorMessage);
+                    callback.onFailure(errorCode);
+                }
+            });
+            return;
         }
         callback.onSuccess();
     }
@@ -778,8 +1111,143 @@ public class OutService {
         void onFailure(int errorCode, String errorMessage);
     }
 
-    //把媒体文件传输到对方域。本方的对象存储地址域外无法访问，需要先在本方下载，边下边传给对端，成功后回调返回对方域保存后的文件地址
-    private void transferFile(String remoteDomainId, String mediaUrl, int mediaType, TransferFileCallback callback) {
+    //组合消息的大文件需要下载后改写再上传。包内可见，方便单元测试替换文件传输实现。
+    void transferCompositeFile(String remoteDomainId, String mediaUrl, int mediaType, String localDomainId, boolean isPublish, int depth, TransferFileCallback callback) {
+        //映射命中说明这个文件之前已经传过，直接复用对端地址，不再重复下载上传(地址在保存前已经校验过)
+        Optional<String> mappedMediaUrl = mediaUrlMappingService.findRemoteMediaUrl(remoteDomainId, mediaUrl);
+        if(mappedMediaUrl.isPresent()) {
+            callback.onSuccess(mappedMediaUrl.get());
+            return;
+        }
+        if(!isAllowedMediaUrl(mediaUrl)) {
+            callback.onFailure(ERROR_INVALID_PARAMETER.code, "媒体地址不合法，只允许http/https且需要在白名单内");
+            return;
+        }
+        Optional<Domain> optionalDomain = domainRepository.findById(remoteDomainId);
+        if(!optionalDomain.isPresent()) {
+            callback.onFailure(ERROR_NOT_EXIST.code, "服务实体（" + remoteDomainId + ")不存在");
+            return;
+        }
+        Domain domain = optionalDomain.get();
+        try {
+            transferFileExecutor.execute(() -> downloadCompositeFile(domain, remoteDomainId, mediaUrl, mediaType, localDomainId, isPublish, depth, callback));
+        } catch (RejectedExecutionException e) {
+            callback.onFailure(ERROR_SERVER_ERROR.code, "文件传输队列已满，请稍后重试");
+        }
+    }
+
+    //包内可见，方便单元测试替换"下载+改写+上传"的实现
+    void downloadCompositeFile(Domain domain, String remoteDomainId, String mediaUrl, int mediaType, String localDomainId, boolean isPublish, int depth, TransferFileCallback callback) {
+        //组合文件要整个读进内存解析成JSON，用单独的大小上限(默认10MB)，不能沿用普通文件的100MB
+        long maxBytes = compositeFileMaxSizeMb > 0 ? compositeFileMaxSizeMb * 1024 * 1024 : -1;
+        byte[] content;
+        String downloadUrl = presignLocalMediaUrl(mediaUrl);
+        try (Response response = fileHttpClient.newCall(new Request.Builder().url(downloadUrl).get().build()).execute()) {
+            if(response.isRedirect()) {
+                callback.onFailure(ERROR_SERVER_ERROR.code, "download file redirect is not allowed");
+                return;
+            }
+            if(!response.isSuccessful() || response.body() == null) {
+                callback.onFailure(ERROR_SERVER_ERROR.code, "download composite file failure, status code:" + response.code());
+                return;
+            }
+            long contentLength = response.body().contentLength();
+            if(maxBytes > 0 && contentLength > maxBytes) {
+                callback.onFailure(ERROR_INVALID_PARAMETER.code, "组合消息文件超过大小限制 " + compositeFileMaxSizeMb + "MB");
+                return;
+            }
+            content = readAll(response.body().byteStream(), maxBytes);
+        } catch (Exception e) {
+            LOG.error("download composite file failure, mediaUrl {}", mediaUrl, e);
+            callback.onFailure(ERROR_SERVER_ERROR.code, "download composite file failure");
+            return;
+        }
+
+        JsonObject composite;
+        try {
+            composite = CompositeMessageUtils.decode(content);
+        } catch (Exception e) {
+            LOG.error("invalid composite file, mediaUrl {}", mediaUrl, e);
+            callback.onFailure(ERROR_INVALID_PARAMETER.code, "invalid composite file");
+            return;
+        }
+        try {
+            convertCompositeMessages(remoteDomainId, CompositeMessageUtils.messages(composite), 0, localDomainId, isPublish, depth, new ConvertCallback() {
+                @Override
+                public void onSuccess() {
+                    uploadCompositeFile(domain, remoteDomainId, mediaUrl, mediaType, composite, callback);
+                }
+
+                @Override
+                public void onFailure(int errorCode) {
+                    callback.onFailure(errorCode, "convert composite file failure");
+                }
+            });
+        } catch (Exception e) {
+            LOG.error("convert composite file failure, mediaUrl {}", mediaUrl, e);
+            callback.onFailure(ERROR_SERVER_ERROR.code, "convert composite file failure");
+        }
+    }
+
+    private byte[] readAll(InputStream inputStream, long maxBytes) throws IOException {
+        InputStream limitedStream = maxBytes > 0 ? new LimitedInputStream(inputStream, maxBytes) : inputStream;
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        int read;
+        while((read = limitedStream.read(buffer)) != -1) {
+            outputStream.write(buffer, 0, read);
+        }
+        return outputStream.toByteArray();
+    }
+
+    private void uploadCompositeFile(Domain domain, String remoteDomainId, String mediaUrl, int mediaType, JsonObject composite, TransferFileCallback callback) {
+        try {
+            byte[] contentBytes = composite.toString().getBytes(StandardCharsets.UTF_8);
+            long maxBytes = compositeFileMaxSizeMb > 0 ? compositeFileMaxSizeMb * 1024 * 1024 : -1;
+            if(maxBytes > 0 && contentBytes.length > maxBytes) {
+                callback.onFailure(ERROR_INVALID_PARAMETER.code, "组合消息文件超过大小限制 " + compositeFileMaxSizeMb + "MB");
+                return;
+            }
+            RequestBody uploadBody = new RequestBody() {
+                @Override
+                public MediaType contentType() {
+                    return MediaType.parse("application/json; charset=utf-8");
+                }
+
+                @Override
+                public long contentLength() {
+                    return contentBytes.length;
+                }
+
+                @Override
+                public void writeTo(BufferedSink sink) throws IOException {
+                    sink.write(contentBytes);
+                }
+            };
+            Map<String, String> extraHeaders = transferFileHeaders(mediaUrl, mediaType);
+            String content = HttpUtils.httpPostStreamToDomain(domain, "/transfer_file", extraHeaders, uploadBody, fileTransferTimeoutMinutes);
+            MeshRestResult<String> meshRestResult = JsonUtils.fromJsonObject2(content, String.class);
+            if(meshRestResult.getLocal_mesh_code() == 0 && meshRestResult.getRemote_mesh_code() == 0 && meshRestResult.getRemote_im_code() == 0 && !TextUtils.isEmpty(meshRestResult.getResult())) {
+                mediaUrlMappingService.saveMapping(remoteDomainId, mediaUrl, meshRestResult.getResult());
+                callback.onSuccess(meshRestResult.getResult());
+            } else {
+                callback.onFailure(ERROR_SERVER_ERROR.code, "transfer composite file failure! result: " + content);
+            }
+        } catch (Exception e) {
+            LOG.error("upload composite file to domain {} failure, mediaUrl {}", remoteDomainId, mediaUrl, e);
+            callback.onFailure(ERROR_SERVER_ERROR.code, "upload composite file failure");
+        }
+    }
+
+    //把媒体文件传输到对方域。本方的对象存储地址域外无法访问，需要先在本方下载，边下边传给对端，成功后回调返回对方域保存后的文件地址。
+    //包内可见，方便单元测试替换文件传输实现。
+    void transferFile(String remoteDomainId, String mediaUrl, int mediaType, TransferFileCallback callback) {
+        //映射命中说明这个文件之前已经传过，直接复用对端地址，不再重复上传(地址在保存前已经校验过)
+        Optional<String> mappedMediaUrl = mediaUrlMappingService.findRemoteMediaUrl(remoteDomainId, mediaUrl);
+        if(mappedMediaUrl.isPresent()) {
+            callback.onSuccess(mappedMediaUrl.get());
+            return;
+        }
         if(!isAllowedMediaUrl(mediaUrl)) {
             LOG.error("transfer file to domain {} rejected, illegal mediaUrl {}", remoteDomainId, mediaUrl);
             callback.onFailure(ERROR_INVALID_PARAMETER.code, "媒体地址不合法，只允许http/https且需要在白名单内");
@@ -800,7 +1268,8 @@ public class OutService {
         }
     }
 
-    private void doTransferFile(Domain domain, String remoteDomainId, String mediaUrl, int mediaType, TransferFileCallback callback) {
+    //包内可见，方便单元测试替换"下载+上传"的实现
+    void doTransferFile(Domain domain, String remoteDomainId, String mediaUrl, int mediaType, TransferFileCallback callback) {
         //本域对象存储可能是私有读，如果地址是本域配置的桶地址，先签名出1小时内可读的临时地址再下载
         String downloadUrl = presignLocalMediaUrl(mediaUrl);
         try (Response downloadResponse = fileHttpClient.newCall(new Request.Builder().url(downloadUrl).get().build()).execute()) {
@@ -851,13 +1320,12 @@ public class OutService {
                 }
             };
 
-            Map<String, String> extraHeaders = new HashMap<>();
-            extraHeaders.put("x-media-type", String.valueOf(mediaType));
-            extraHeaders.put("x-file-extension", extensionOf(mediaUrl));
+            Map<String, String> extraHeaders = transferFileHeaders(mediaUrl, mediaType);
 
             String content = HttpUtils.httpPostStreamToDomain(domain, "/transfer_file", extraHeaders, uploadBody, fileTransferTimeoutMinutes);
             MeshRestResult<String> meshRestResult = JsonUtils.fromJsonObject2(content, String.class);
             if(meshRestResult.getLocal_mesh_code() == 0 && meshRestResult.getRemote_mesh_code() == 0 && meshRestResult.getRemote_im_code() == 0 && !TextUtils.isEmpty(meshRestResult.getResult())) {
+                mediaUrlMappingService.saveMapping(remoteDomainId, mediaUrl, meshRestResult.getResult());
                 callback.onSuccess(meshRestResult.getResult());
             } else {
                 callback.onFailure(ERROR_SERVER_ERROR.code, "transfer file failure! result: " + content);
@@ -1016,6 +1484,19 @@ public class OutService {
         int first = bytes[0] & 0xff;
         int second = bytes[1] & 0xff;
         return first == 100 && second >= 64 && second <= 127;
+    }
+
+    //传给对端 /transfer_file 的header。x-source-media-url 是本域原始地址，对端用它建立反向映射，
+    //这样同一个文件再发回本域时可以直接复用本域地址，不需要重新上传。
+    Map<String, String> transferFileHeaders(String mediaUrl, int mediaType) {
+        Map<String, String> headers = new HashMap<>();
+        headers.put("x-media-type", String.valueOf(mediaType));
+        headers.put("x-file-extension", extensionOf(mediaUrl));
+        String sourceMediaUrl = MediaTransferUtils.encodeSourceUrl(mediaUrl);
+        if(sourceMediaUrl != null) {
+            headers.put(MediaTransferUtils.SOURCE_MEDIA_URL_HEADER, sourceMediaUrl);
+        }
+        return headers;
     }
 
     private static String extensionOf(String mediaUrl) {
