@@ -90,6 +90,38 @@ class JpaQueryValidationTest {
     }
 
     @Test
+    void mediaMappingCleanupQueriesAreValid() {
+        try (Session session = sessionFactory.openSession()) {
+            session.beginTransaction();
+            for (int i = 0; i < 3; i++) {
+                MediaUrlMapping mapping = new MediaUrlMapping();
+                mapping.domainId = "C";
+                mapping.localUrlHash = "cl" + i;
+                mapping.localMediaUrl = "https://a/c" + i + ".png";
+                mapping.remoteUrlHash = "cr" + i;
+                mapping.remoteMediaUrl = "https://c/c" + i + ".png";
+                mapping.createdAt = 1000L + i;
+                session.save(mapping);
+            }
+            session.flush();
+
+            //和 MediaUrlMappingRepository 里的 JPQL 保持一致：分页取最旧的一批 ID，再按 ID 删除
+            java.util.List<Long> ids = session.createQuery(
+                    "select m.id from MediaUrlMapping m where m.createdAt is not null and m.createdAt < :cutoff order by m.createdAt", Long.class)
+                .setParameter("cutoff", 1002L)
+                .setMaxResults(1)
+                .list();
+            assertEquals(1, ids.size());
+
+            int deleted = session.createQuery("delete from MediaUrlMapping m where m.id in :ids")
+                .setParameterList("ids", ids)
+                .executeUpdate();
+            assertEquals(1, deleted);
+            session.getTransaction().rollback();
+        }
+    }
+
+    @Test
     void mediaMappingTableHasCreatedAtIndex() {
         try (Session session = sessionFactory.openSession()) {
             //H2 的 information_schema 校验 created_at 索引存在，避免清理任务走全表扫描

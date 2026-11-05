@@ -7,6 +7,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
@@ -215,9 +217,20 @@ public class MediaUrlMappingService {
         String localCacheKey = cacheKey(domainId, localMediaUrl);
         String remoteCacheKey = cacheKey(domainId, remoteMediaUrl);
         try {
-            //upsert：已存在就忽略，避免"先查后插"多一次查询，也避免并发下的唯一键异常
-            repository.insertIgnore(domainId, hash(localMediaUrl), localMediaUrl, hash(remoteMediaUrl), remoteMediaUrl,
-                System.currentTimeMillis());
+            //直接插入，不"先查后插"，少一次查询。不用 MySQL 的 on duplicate key 这类方言，保证各数据库通用；
+            //已存在（如并发下另一个请求先插入）会触发唯一键冲突，按"已存在"处理即可
+            MediaUrlMapping mapping = new MediaUrlMapping();
+            mapping.domainId = domainId;
+            mapping.localUrlHash = hash(localMediaUrl);
+            mapping.localMediaUrl = localMediaUrl;
+            mapping.remoteUrlHash = hash(remoteMediaUrl);
+            mapping.remoteMediaUrl = remoteMediaUrl;
+            mapping.createdAt = System.currentTimeMillis();
+            try {
+                repository.save(mapping);
+            } catch (DataIntegrityViolationException e) {
+                LOG.debug("media url mapping already exists, domain {}, local media url {}", domainId, localMediaUrl);
+            }
             remoteMediaUrlCache.put(localCacheKey, remoteMediaUrl);
             localMediaUrlCache.put(remoteCacheKey, localMediaUrl);
             removeNegative(localCacheKey);
@@ -238,9 +251,12 @@ public class MediaUrlMappingService {
         try {
             int total = 0;
             for (int i = 0; i < CLEANUP_MAX_BATCHES; i++) {
-                int deleted = repository.deleteExpired(cutoff, batchSize);
-                total += deleted;
-                if(deleted < batchSize) {
+                List<Long> ids = repository.findExpiredIds(cutoff, PageRequest.of(0, batchSize));
+                if(ids.isEmpty()) {
+                    break;
+                }
+                total += repository.deleteByIds(ids);
+                if(ids.size() < batchSize) {
                     break;
                 }
             }
