@@ -123,6 +123,29 @@ export BRIDGE_ADMIN_INIT_PASSWORD='一个足够强的初始密码'
 
 在安全认证方面，adminService使用了shiro权限管理；outService接收本侧IM服务回调时是无认证的；outService调用远端inService会用接收方域密钥计算签名进行认证，详细信息请查看```shiro```目录和```multiport```目录。
 
+## 消息流转（send_message 与 publish）
+Mesh 中一条消息最多经过两跳：先 `send_message` 到会话所在域，再由会话所在域 `publish` 给其他成员域。
+
+假设域1有用户 A、B，域2有用户 C，群 G 的所在域是域2，A、B、C 都是群成员：
+
+1. **A 在 G 中发消息**
+   - 域1 的 IM 回调本域桥接服务的 `/internal/send_message`。桥接服务把 target 转成域2 的本地群 ID（`G`）、sender 转成 `A@域1`，再调用域2 的 `/api/send_message`。
+   - 域2 的桥接服务用 `A@域1` 作为 sender 调用本域 IM 的发送接口；域2 的 IM 保存消息（消息 ID 为 `D2_uid`）并投递给本域成员 C。
+   - 域2 的 IM 发现群里有外域成员 `A@域1`、`B@域1`，回调本域桥接服务的 `/internal/publish_message`。桥接服务把 target 转回域1 视角的 `G@域2`、sender 转成 `A`（域1 的本地 ID）、receivers 转成 `A`、`B`，调用域1 的 `/api/publish_message`，messageId 为 `D2_uid`。
+   - 域1 的桥接服务用 `out_message_ids` 中的 `(A 的消息 ID, 域2) -> D2_uid` 判断这是“本域消息被 publish 回来”，用 A 的本地消息 ID 调 publishMessage 投递给 B（A 自己会被 IM 去重）。
+2. **C 在 G 中发消息**
+   - 域2 的 IM 直接回调桥接服务 publish 到域1，sender 是 `C@域2`（外部 ID），messageId 是 C 在域2 的消息 ID。
+   - 域1 的桥接服务查不到 out 记录，按新消息处理，创建一条 `C@域2` 的消息投递给 A、B。
+3. **群信息和群操作**
+   - 域1 查域2 的群信息时调用 `/api/batch_group_infos`，群 ID 传的是域2 的本地 ID（裸 ID，如 `G`）；加人、踢人、改群名等群操作同理，operator 是 `A@域1`。
+   - 群操作产生的通知由群所在域的 IM 生成，publish 回域1 时 sender 是本地 ID（如 `A`），且没有 out 记录。
+
+由此对应的校验规则（`InService`）：
+
+* `publish` 的 sender 一般是外部 ID；本域 ID 只允许三种情况：publish-back（`out_message_ids` 有反向记录）、republish（删除/撤回/更正）、群/聊天室/频道里的通知类消息（type 100~199）。
+* 群 ID 允许本域裸 ID（本域群）或带 `@本域` 后缀；第三方域的群 ID 会被拒绝。
+* 不要把 `in_message_ids` / `out_message_ids` 清得太干净，否则老的 publish-back、撤回和更新会找不到映射。
+
 ## 二开需要注意事项和技术支持
 一般都会使用自定义消息来对接业务，在自定义消息体中，如果包含有ID，需要在bridge发送出请求之前转化为对方的视角。比如是个名片消息，消息体内包含有用户ID。比如域1中的用户A，给域2中的用户甲发送一张名片：
 1. 假如名片是域1中的用户B，那么在桥接服务请求出去的消息体内，需要把用户B的用户ID和账号拼接上域1的域ID。
