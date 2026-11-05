@@ -85,6 +85,13 @@ class JpaQueryValidationTest {
                 .setParameter("domainId", "A")
                 .setParameterList("ids", Collections.singletonList(100L))
                 .list().size());
+
+            //原先是原生 SQL(select ... limit 1)，改成 JPQL 后校验一下能正常生成
+            assertEquals(1, session.createQuery(
+                    "select i.id.messageId from InMessageIds i where i.id.domainId = :domainId and i.localMessageId = :localMessageId")
+                .setParameter("domainId", "A")
+                .setParameter("localMessageId", 100L)
+                .list().size());
             session.getTransaction().commit();
         }
     }

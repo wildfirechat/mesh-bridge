@@ -67,6 +67,13 @@
 			<version>8.0.33</version>
 		</dependency>
 
+		<!-- 支持切换到 PostgreSQL；达梦/金仓的驱动和方言包请按厂商文档获取后加入 classpath -->
+		<dependency>
+			<groupId>org.postgresql</groupId>
+			<artifactId>postgresql</artifactId>
+			<scope>runtime</scope>
+		</dependency>
+
 		<dependency>
 			<groupId>com.google.code.gson</groupId>
 			<artifactId>gson</artifactId>

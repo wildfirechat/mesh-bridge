@@ -51,6 +51,23 @@ bridge.my_domain_id=${BRIDGE_MY_DOMAIN_ID}
 
 剩下的就是数据库了，需要手动创建数据库，使用命令```create database bridge;```创建数据库。服务使用 JPA 自动创建表。管理员账户不再使用固定默认密码，而是在首次启动时根据环境变量 `BRIDGE_ADMIN_INIT_PASSWORD` 创建（至少 8 位）；创建成功后请删除该环境变量并尽快修改密码。
 
+### 数据库兼容性
+默认使用 MySQL。代码中没有 MySQL 专有 SQL，所有查询都是 JPQL/派生查询，由 Hibernate 按数据库方言生成，可以切换到 PostgreSQL、达梦和金仓。
+
+| 数据库 | `DB_URL` 示例 | 驱动和方言 |
+| --- | --- | --- |
+| MySQL 5.7/8.0 | `jdbc:mysql://host:3306/bridge?createDatabaseIfNotExist=true&serverTimezone=UTC&useSSL=true&requireSSL=true` | 已内置，自动识别 |
+| PostgreSQL 12+ | `jdbc:postgresql://host:5432/bridge?sslmode=require` | 已内置驱动，方言自动识别 |
+| 达梦 DM8 | `jdbc:dm://host:5236/bridge` | 需把厂商 JDBC 驱动和 Hibernate 方言包加入 classpath，再设置方言 |
+| 金仓 KingbaseES V8 | `jdbc:kingbase8://host:54321/bridge` | 需把厂商 JDBC 驱动和 Hibernate 方言包加入 classpath，再设置方言 |
+
+- 驱动类一般不配，Spring Boot 会根据 URL 推断；达梦/金仓推断不了时设置 `SPRING_DATASOURCE_DRIVER_CLASS_NAME`。
+- 方言能自动识别的（MySQL/PostgreSQL）不用配；达梦/金仓需要设置 `SPRING_JPA_DATABASE_PLATFORM` 指向厂商提供的 Hibernate 方言类（具体类名以厂商文档为准）。
+- 建表：默认 `DB_DDL_AUTO=update`，由 Hibernate 按方言建表；生产环境建议 `validate`，并用 Flyway/Liquibase 管理表结构。达梦/金仓建议先在测试库确认自动建表是否完整，必要时手工建表。
+- URL 字段：`media_url` 和 `media_url_mappings` 中存 URL 的列是 `varchar(4096)`，达梦的 VARCHAR 长度按字节计算，部署前请确认字符集和长度设置；这些列不参与索引，只有 64 位 hash 建索引。
+- 文档里的手工 SQL（建表、清理消息 ID）以 MySQL 为例，其他库按方言调整（`AUTO_INCREMENT` 换成 identity/serial，`UNIX_TIMESTAMP`、`<<` 等函数需要改写）。
+- 达梦/金仓的 JDBC 驱动和方言包请按厂商文档获取（部分版本未发布到 Maven 中央仓库），可以通过 `mvn install:install-file` 安装，或用 `-Dloader.path`/classpath 方式加入。
+
 ## 后端编译
 需要 JDK 11+（Shiro 2.2.0 的最低要求）。在前端编译成功和后端配置之后，在项目目录下执行:
 ```
