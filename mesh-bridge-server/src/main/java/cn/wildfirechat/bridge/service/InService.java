@@ -205,15 +205,68 @@ public class InService {
         return id;
     }
 
-    private void requireGroupDomain(String domainId, String groupId) {
+    //群 ID 允许是"本域群"（裸 ID，或带 @本域 后缀），也允许是请求方域自己的群；
+    //对端调用本域接口时，本域的群就是以裸 ID 传过来的，不能要求必须是外部 ID。
+    void requireGroupDomain(String domainId, String groupId) {
         requireDomainId(domainId);
-        if (!StringUtils.hasText(groupId) || !DomainIdUtils.isExternalId(groupId)) {
-            throw new IllegalArgumentException("groupId must be an external id");
+        if (!StringUtils.hasText(groupId)) {
+            throw new IllegalArgumentException("groupId is empty");
+        }
+        if (!DomainIdUtils.isExternalId(groupId)) {
+            return;
         }
         String groupDomain = DomainIdUtils.getExternalId(groupId);
         if (!myDomainId.equals(groupDomain) && !domainId.equals(groupDomain)) {
             throw new IllegalArgumentException("group does not belong to this domain");
         }
+    }
+
+    /**
+     * publish 的发送者校验：普通情况发送者必须是外部 ID；但下面几种情况发送者会是本域 ID（裸 ID），不能拒绝：
+     * 1. 本域发出的消息被对端 publish 回来（out_message_ids 里有反向记录）；
+     * 2. 删除/撤回/更正后的 republish；
+     * 3. 群操作通知等由群所在域的 IM 代本域用户生成的消息（type 100~199）。
+     * 除此之外，对端不能凭空伪造本域用户的新消息。
+     */
+    String requirePublishSender(String domainId, String sender, boolean localSenderAllowed) {
+        requireDomainId(domainId);
+        if (!StringUtils.hasText(sender)) {
+            throw new IllegalArgumentException("sender is empty");
+        }
+        if (DomainIdUtils.isExternalId(sender)) {
+            String senderDomain = DomainIdUtils.getExternalId(sender);
+            if (myDomainId.equals(senderDomain)) {
+                //本域用户的"外部形式"，同样只允许上述场景，并换回本域 ID
+                if (!localSenderAllowed) {
+                    throw new IllegalArgumentException("sender must not be a local user");
+                }
+                return DomainIdUtils.toInternalId(myDomainId, sender, myDomainId);
+            }
+            return sender;
+        }
+        if (!localSenderAllowed) {
+            throw new IllegalArgumentException("sender must be an external id");
+        }
+        return sender;
+    }
+
+    //群操作通知等系统消息：由群所在域的 IM 代替操作者生成，publish 回操作者所在域时没有 out_message_ids 记录
+    static boolean allowsLocalPublishSender(boolean publishedBack, boolean republish, int messageType, int conversationType) {
+        if (publishedBack || republish) {
+            return true;
+        }
+        //只允许群/聊天室/频道里的通知类消息，避免对端用本域用户身份伪造单聊通知
+        return isNotificationMessage(messageType) && isGroupConversation(conversationType);
+    }
+
+    static boolean isNotificationMessage(int messageType) {
+        return messageType >= 100 && messageType < 200;
+    }
+
+    private static boolean isGroupConversation(int conversationType) {
+        return conversationType == ProtoConstants.ConversationType.ConversationType_Group
+            || conversationType == ProtoConstants.ConversationType.ConversationType_ChatRoom
+            || conversationType == ProtoConstants.ConversationType.ConversationType_Channel;
     }
 
     private void requireMessageBelongsToDomain(String domainId, long messageId) {
@@ -455,7 +508,12 @@ public class InService {
                 if (receivers == null || receivers.isEmpty()) {
                     throw new IllegalArgumentException("receivers is empty");
                 }
-                requireExternalActor(domainId, messageData.getSender(), "sender");
+                //先按 (messageId, 来源域) 反查本域是否发过这条消息：
+                //有记录说明是对端把本域消息 publish 回来，此时发送者可能是本域 ID（裸 ID），是合法的
+                Optional<OutMessageIds> outMessageOptional = outMessageIdsRepository.findByToDomainIdAndToMessageId(domainId, messageId);
+                boolean localSenderAllowed = allowsLocalPublishSender(outMessageOptional.isPresent(), republish,
+                    messageData.getPayload().getType(), messageData.getConv().getType());
+                messageData.setSender(requirePublishSender(domainId, messageData.getSender(), localSenderAllowed));
                 messageData.getConv().setTarget(normalizeTargetId(messageData.getConv().getTarget()));
                 List<String> safeReceivers = normalizeTargets(receivers);
                 restoreCompositeMediaUrls(domainId, messageData.getPayload());
@@ -483,7 +541,6 @@ public class InService {
                         inExist = false;
                     }
 
-                    Optional<OutMessageIds> outMessageOptional = outMessageIdsRepository.findByToDomainIdAndToMessageId(domainId, messageId);
                     if(outMessageOptional.isPresent()) {
                         restoreLocalMediaUrl(domainId, messageData.getPayload(), outMessageOptional.get().mediaUrl);
                         IMResult<Void> imResult = MeshAdmin.updateMessageContent(messageData.getSender(), outMessageOptional.get().messageId, messageData.getPayload(), true);
@@ -501,7 +558,6 @@ public class InService {
                         }
                     }
                 } else {
-                    Optional<OutMessageIds> outMessageOptional = outMessageIdsRepository.findByToDomainIdAndToMessageId(domainId, messageId);
                     //只有"本域发出、被对端 publish 回本域"的消息才有对应记录，对端自己发起的消息没有记录，不能直接 get()
                     restoreLocalMediaUrl(domainId, messageData.getPayload(), outMessageOptional.map(outMessageIds -> outMessageIds.mediaUrl).orElse(null));
                     IMResult<SendMessageResult> imResult = MeshAdmin.publishMessage(messageData, safeReceivers, outMessageOptional.isPresent()?outMessageOptional.get().messageId:0);
