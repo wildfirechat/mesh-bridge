@@ -366,13 +366,15 @@ public class OutService {
         }
         Domain domain = optionalDomain.get();
 
+        //消息ID映射要用转换前的本域发送者判断消息来源，不能传转换后的对方视角ID
+        String originalSender = messageData.getSender();
         messageData.getConv().setTarget(DomainIdUtils.toExternalId(domainId, messageData.getConv().getTarget(), myDomainId));
-        messageData.setSender(DomainIdUtils.toExternalId(domainId, messageData.getSender(), myDomainId));
+        messageData.setSender(DomainIdUtils.toExternalId(domainId, originalSender, myDomainId));
 
         DeferredResult<String> deferredResult = newTransferAwareDeferredResult();
 
         String originalMediaUrl = messageData.getPayload().getRemoteMediaUrl();
-        convertMessagePayloadDomainId(domainId, messageData.getPayload(), myDomainId, false, false, new ConvertCallback() {
+        convertMessagePayloadDomainId(domainId, messageData.getPayload(), myDomainId, false, false, originalSender, new ConvertCallback() {
             @Override
             public void onSuccess() {
                 PojoSendMessageReq req = new PojoSendMessageReq();
@@ -459,10 +461,14 @@ public class OutService {
     //这里是出去的消息进行转换的地方，消息中包含的用户ID/群组ID/频道ID和消息ID等需要转换为对方视角的ID。
     //理论上所有二开只能局限于这个函数。如果有其他改动容易出问题。如果其他地方需要改动，请给我们提PR或者联系我们修改，确保其他部分保持一致。
     private void convertMessagePayloadDomainId(String remoteDomainId, MessagePayload messagePayload, String localDomainId, boolean isPublish, boolean isPublish2OriganlDomain, ConvertCallback callback) {
-        convertMessagePayloadDomainId(remoteDomainId, messagePayload, localDomainId, isPublish, isPublish2OriganlDomain, 0, callback);
+        convertMessagePayloadDomainId(remoteDomainId, messagePayload, localDomainId, isPublish, isPublish2OriganlDomain, null, callback);
     }
 
-    private void convertMessagePayloadDomainId(String remoteDomainId, MessagePayload messagePayload, String localDomainId, boolean isPublish, boolean isPublish2OriganlDomain, int depth, ConvertCallback callback) {
+    private void convertMessagePayloadDomainId(String remoteDomainId, MessagePayload messagePayload, String localDomainId, boolean isPublish, boolean isPublish2OriganlDomain, String messageSender, ConvertCallback callback) {
+        convertMessagePayloadDomainId(remoteDomainId, messagePayload, localDomainId, isPublish, isPublish2OriganlDomain, messageSender, 0, callback);
+    }
+
+    private void convertMessagePayloadDomainId(String remoteDomainId, MessagePayload messagePayload, String localDomainId, boolean isPublish, boolean isPublish2OriganlDomain, String messageSender, int depth, ConvertCallback callback) {
         if(depth > CompositeMessageUtils.MAX_NEST_DEPTH) {
             LOG.error("message nesting is too deep, depth {}, remoteDomainId {}", depth, remoteDomainId);
             callback.onFailure(ERROR_INVALID_PARAMETER.code);
@@ -488,7 +494,7 @@ public class OutService {
                     txtContent.getQuoteInfo().setMessageUid(targetMessageUid);
 
                     // 发送者转换域地址。
-                    txtContent.getQuoteInfo().setUserId(DomainIdUtils.toExternalId(remoteDomainId, txtContent.getQuoteInfo().getUserId(), myDomainId));
+                    txtContent.getQuoteInfo().setUserId(DomainIdUtils.toExternalId(remoteDomainId, txtContent.getQuoteInfo().getUserId(), localDomainId));
 
                     //设置到payload中
                     messagePayload.setBase64edData(Base64.getEncoder().encodeToString(txtContent.getQuoteInfo().encode().toJSONString().getBytes(StandardCharsets.UTF_8)));
@@ -502,9 +508,15 @@ public class OutService {
             }
         } else if(messagePayload.getType() == 400) {
             JsonObject object = decodeJsonPayload(messagePayload.getBase64edData());
-            if(object != null && replaceStringList(object, "ts", remoteDomainId, localDomainId)) {
-                messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
+            if(object != null) {
+                boolean changed = replaceStringList(object, "ts", remoteDomainId, localDomainId);
+                //单人对讲时客户端还会写一个 t，和 ts[0] 相同；多人时 t 是第一个被叫
+                changed |= replaceOutString(object, "t", remoteDomainId, localDomainId);
+                if(changed) {
+                    messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
+                }
             }
+            convertCallPushData(remoteDomainId, messagePayload, localDomainId, false, messageSender);
         } else if(messagePayload.getType() == 406) {
             JsonObject object = decodeJsonPayload(messagePayload.getBase64edData());
             if(object != null) {
@@ -520,6 +532,73 @@ public class OutService {
                 }
                 messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
             }
+            convertCallPushData(remoteDomainId, messagePayload, localDomainId, false, messageSender);
+        } else if(messagePayload.getType() == 402) {
+            //通话结束消息里 u 是邀请消息在本域的消息ID，需要换成目标域的消息ID
+            JsonObject object = decodeJsonPayload(messagePayload.getBase64edData());
+            if(object != null && object.has("u") && object.get("u").isJsonPrimitive()) {
+                long inviteMessageUid = object.get("u").getAsLong();
+                if(inviteMessageUid > 0) {
+                    Optional<Long> mappedUid = findMappedMessageUid(remoteDomainId, messageSender, inviteMessageUid);
+                    //有发送者时找不到映射置0，表示目标域未知；没有发送者(旧调用)时保持原值，避免破坏数据
+                    if(mappedUid.isPresent()) {
+                        object.addProperty("u", mappedUid.get());
+                        messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
+                    } else if(StringUtils.hasText(messageSender)) {
+                        object.addProperty("u", 0);
+                        messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
+                    }
+                }
+            }
+            convertCallPushData(remoteDomainId, messagePayload, localDomainId, true, messageSender);
+        } else if(messagePayload.getType() == 408 || messagePayload.getType() == 420) {
+            //会议邀请/PTT邀请里的 h 是主持人用户ID
+            JsonObject object = decodeJsonPayload(messagePayload.getBase64edData());
+            if(object != null && replaceOutString(object, "h", remoteDomainId, localDomainId)) {
+                messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
+            }
+        } else if(messagePayload.getType() == 416) {
+            //多人通话进行中消息：发起人和所有被叫都是用户ID
+            JsonObject object = decodeJsonPayload(messagePayload.getBase64edData());
+            if(object != null) {
+                boolean changed = replaceOutString(object, "initiator", remoteDomainId, localDomainId);
+                changed |= replaceStringList(object, "targetIds", remoteDomainId, localDomainId);
+                changed |= replaceStringList(object, "targets", remoteDomainId, localDomainId);
+                if(changed) {
+                    messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
+                }
+            }
+        } else if(messagePayload.getType() == 17) {
+            //接龙/收藏消息：群ID、创建者、每条参与记录的用户ID
+            JsonObject object = decodeJsonPayload(messagePayload.getBase64edData());
+            if(object != null) {
+                boolean changed = replaceOutString(object, "groupId", remoteDomainId, localDomainId);
+                changed |= replaceOutString(object, "creatorId", remoteDomainId, localDomainId);
+                JsonElement entries = object.get("entries");
+                if(entries != null && entries.isJsonArray()) {
+                    for (JsonElement entry : entries.getAsJsonArray()) {
+                        if(entry.isJsonObject()) {
+                            changed |= replaceOutString(entry.getAsJsonObject(), "userId", remoteDomainId, localDomainId);
+                        }
+                    }
+                }
+                if(changed) {
+                    messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
+                }
+            }
+        } else if(messagePayload.getType() == 18 || messagePayload.getType() == 19) {
+            //投票/投票结果：群ID和创建者
+            JsonObject object = decodeJsonPayload(messagePayload.getBase64edData());
+            if(object != null) {
+                boolean changed = replaceOutString(object, "groupId", remoteDomainId, localDomainId);
+                changed |= replaceOutString(object, "creatorId", remoteDomainId, localDomainId);
+                if(changed) {
+                    messagePayload.setBase64edData(Base64.getEncoder().encodeToString(object.toString().getBytes(StandardCharsets.UTF_8)));
+                }
+            }
+        } else if(messagePayload.getType() == 26) {
+            //转写消息的 content 是 JSON，里面带发言人用户ID
+            convertTranscriptionUserId(remoteDomainId, messagePayload, localDomainId);
         }
         //Call ID
         if(messagePayload.getType() >= 400 && messagePayload.getType() <= 407) {
@@ -578,19 +657,27 @@ public class OutService {
             return;
         }
 
-        if(messagePayload.getType() >= 104 && messagePayload.getType() <= 124) {
+        if(messagePayload.getType() >= 104 && messagePayload.getType() <= 125) {
             JsonObject object = decodeJsonPayload(messagePayload.getBase64edData());
             if(object != null) {
                 replaceOutString(object, "o", remoteDomainId, localDomainId);
                 replaceOutString(object, "g", remoteDomainId, localDomainId);
                 switch (messagePayload.getType()) {
                     case 105:  //add group member
+                        //n 是审批人用户ID
+                        replaceOutString(object, "n", remoteDomainId, localDomainId);
+                        replaceStringList(object, "ms", remoteDomainId, localDomainId);
+                        break;
                     case 106:  //kickoff group member
                     case 120:  //kickoff group member visible
                     case 117:  //change group manager
                     case 118:  //change group member mute state
                     case 119:  //change group member allow state
                         replaceStringList(object, "ms", remoteDomainId, localDomainId);
+                        break;
+                    case 125:  //reject join group
+                        //mi 是被拒绝的用户ID
+                        replaceOutString(object, "mi", remoteDomainId, localDomainId);
                         break;
                     case 109:  //transfer group
                     case 111:  //change group member alias
@@ -625,6 +712,74 @@ public class OutService {
             return null;
         }
         return JsonParser.parseString(new String(Base64.getDecoder().decode(base64edData), StandardCharsets.UTF_8)).getAsJsonObject();
+    }
+
+    //通话类消息的 pushData 里也带参与者用户ID，推送打开时客户端会用到
+    private void convertCallPushData(String remoteDomainId, MessagePayload messagePayload, String localDomainId,
+                                     boolean convertInviteUid, String messageSender) {
+        if(!StringUtils.hasText(messagePayload.getPushData())) {
+            return;
+        }
+        try {
+            JsonElement element = JsonParser.parseString(messagePayload.getPushData());
+            if(!element.isJsonObject()) {
+                return;
+            }
+            JsonObject object = element.getAsJsonObject();
+            boolean changed = replaceStringList(object, "participants", remoteDomainId, localDomainId);
+            if(object.has("existParticipants") && object.get("existParticipants").isJsonArray()) {
+                JsonArray participants = new JsonArray();
+                for (JsonElement participant : object.getAsJsonArray("existParticipants")) {
+                    if(participant.isJsonPrimitive()) {
+                        participants.add(DomainIdUtils.toExternalId(remoteDomainId, participant.getAsString(), localDomainId));
+                        changed = true;
+                    } else if(participant.isJsonObject() && participant.getAsJsonObject().has("userId")) {
+                        JsonObject participantObject = participant.getAsJsonObject();
+                        replaceOutString(participantObject, "userId", remoteDomainId, localDomainId);
+                        participants.add(participantObject);
+                        changed = true;
+                    } else {
+                        participants.add(participant);
+                    }
+                }
+                object.add("existParticipants", participants);
+            }
+            if(convertInviteUid && object.has("u") && object.get("u").isJsonPrimitive()) {
+                long inviteMessageUid = object.get("u").getAsLong();
+                Optional<Long> mappedUid = findMappedMessageUid(remoteDomainId, messageSender, inviteMessageUid);
+                if(mappedUid.isPresent()) {
+                    object.addProperty("u", mappedUid.get());
+                    changed = true;
+                } else if(StringUtils.hasText(messageSender)) {
+                    object.addProperty("u", 0);
+                    changed = true;
+                }
+            }
+            if(changed) {
+                messagePayload.setPushData(object.toString());
+            }
+        } catch (Exception e) {
+            LOG.warn("convert call push data failed, pushData is not json");
+        }
+    }
+
+    //转写消息的 content 是 JSON，userId 是发言人，需要换成目标域视角
+    private void convertTranscriptionUserId(String remoteDomainId, MessagePayload messagePayload, String localDomainId) {
+        if(!StringUtils.hasText(messagePayload.getContent())) {
+            return;
+        }
+        try {
+            JsonElement element = JsonParser.parseString(messagePayload.getContent());
+            if(!element.isJsonObject()) {
+                return;
+            }
+            JsonObject object = element.getAsJsonObject();
+            if(replaceOutString(object, "userId", remoteDomainId, localDomainId)) {
+                messagePayload.setContent(object.toString());
+            }
+        } catch (Exception e) {
+            LOG.warn("convert transcription message user id failed, content is not json");
+        }
     }
 
     private void convertCompositeMessagePayload(String remoteDomainId, MessagePayload messagePayload, String localDomainId, boolean isPublish, int depth, ConvertCallback callback) {
@@ -696,7 +851,7 @@ public class OutService {
 
             final CompletableFuture<Integer> converted;
             try {
-                converted = convertCompositeChildPayload(remoteDomainId, childPayload, localDomainId, isPublish, childPublish2OriginalDomain, depth + 1)
+                converted = convertCompositeChildPayload(remoteDomainId, childPayload, localDomainId, isPublish, childPublish2OriginalDomain, originalSender, depth + 1)
                     .thenApply(errorCode -> {
                         if(errorCode == 0) {
                             CompositeMessageUtils.updatePayload(message, childPayload);
@@ -748,9 +903,9 @@ public class OutService {
     }
 
     //转换单个子消息，正常完成返回0，失败返回错误码。用 CompletableFuture 表达完成状态，调用方据此决定是继续循环还是等回调。
-    private CompletableFuture<Integer> convertCompositeChildPayload(String remoteDomainId, MessagePayload childPayload, String localDomainId, boolean isPublish, boolean isPublish2OriganlDomain, int depth) {
+    private CompletableFuture<Integer> convertCompositeChildPayload(String remoteDomainId, MessagePayload childPayload, String localDomainId, boolean isPublish, boolean isPublish2OriganlDomain, String originalSender, int depth) {
         CompletableFuture<Integer> future = new CompletableFuture<>();
-        convertMessagePayloadDomainId(remoteDomainId, childPayload, localDomainId, isPublish, isPublish2OriganlDomain, depth, new ConvertCallback() {
+        convertMessagePayloadDomainId(remoteDomainId, childPayload, localDomainId, isPublish, isPublish2OriganlDomain, originalSender, depth, new ConvertCallback() {
             @Override
             public void onSuccess() {
                 future.complete(0);
@@ -998,9 +1153,11 @@ public class OutService {
         //判断是否publish回消息发送者所在域。必须在ID转换之前判断：转换后本域的群ID和发送者ID都会带上本域后缀，
         //会把"本域群+本域发送者"的正常跨域publish误判成publish回原域，导致跳过文件传输
         boolean isPublish2OriganlDomain = DomainIdUtils.isExternalId(messageData.getSender()) && domainId.equals(DomainIdUtils.getExternalId(messageData.getSender()));
+        //消息ID映射要用转换前的本域发送者判断消息来源，不能传转换后的对方视角ID
+        String originalSender = messageData.getSender();
 
         messageData.getConv().setTarget(DomainIdUtils.toExternalId(domainId, messageData.getConv().getTarget(), myDomainId));
-        messageData.setSender(DomainIdUtils.toExternalId(domainId, messageData.getSender(), myDomainId));
+        messageData.setSender(DomainIdUtils.toExternalId(domainId, originalSender, myDomainId));
 
         List<String> receiverIds = new ArrayList<>();
         for (String receiver : receivers) {
@@ -1014,7 +1171,7 @@ public class OutService {
         req.messageId = messageId;
         String originalMediaUrl = messageData.getPayload().getRemoteMediaUrl();
 
-        convertMessagePayloadDomainId(domainId, messageData.getPayload(), myDomainId, true, isPublish2OriganlDomain, new ConvertCallback() {
+        convertMessagePayloadDomainId(domainId, messageData.getPayload(), myDomainId, true, isPublish2OriganlDomain, originalSender, new ConvertCallback() {
             @Override
             public void onSuccess() {
                 req.messageData = messageData;
