@@ -688,7 +688,10 @@ public class OutService {
                 return;
             }
 
-            boolean childPublish2OriginalDomain = isPublish && DomainIdUtils.isExternalId(originalSender)
+            //子消息的原始发送者就是目标域的用户时，媒体文件本来就在目标域，不能再传回去。
+            //send_message 和 publish 都可能出现这种子消息（比如 1:1 聊天里转发一条对方发的图片），
+            //所以不能只看 isPublish。
+            boolean childPublish2OriginalDomain = DomainIdUtils.isExternalId(originalSender)
                 && remoteDomainId.equals(DomainIdUtils.getExternalId(originalSender));
 
             final CompletableFuture<Integer> converted;
@@ -895,7 +898,15 @@ public class OutService {
     //另一种是A域用户发到A域的群，处理完本域用户后再publish到B、C域。所以存在"A send 到B、B再publish回A"的情况，
     //此时目标域就是消息发送者所在域(isPublish2OriganlDomain)，不需要再传文件，直接用对方已经保存的地址，对端收到后按映射换回本域地址。
     private void convertMessageMedia(String remoteDomainId, MessagePayload messagePayload, String localDomainId, boolean isPublish, boolean isPublish2OriganlDomain, int depth, ConvertCallback callback) {
-        if(TextUtils.isEmpty(messagePayload.getRemoteMediaUrl()) || isPublish2OriganlDomain) {
+        if(TextUtils.isEmpty(messagePayload.getRemoteMediaUrl())) {
+            callback.onSuccess();
+            return;
+        }
+        if(isPublish2OriganlDomain) {
+            //目标就是消息(或组合消息子消息)的来源域，文件本来就在对方域，绝对不能重新上传。
+            //有反向映射时顺手换成对方域的原地址；没有映射就保持原地址，由接收方用消息ID映射再还原。
+            mediaUrlMappingService.findRemoteMediaUrl(remoteDomainId, messagePayload.getRemoteMediaUrl())
+                .ifPresent(messagePayload::setRemoteMediaUrl);
             callback.onSuccess();
             return;
         }

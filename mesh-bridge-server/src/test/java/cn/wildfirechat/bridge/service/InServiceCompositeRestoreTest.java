@@ -55,6 +55,32 @@ class InServiceCompositeRestoreTest {
     }
 
     @Test
+    void restoresChildMediaUrlFromOutMessageMappingWhenMediaMappingMissing() throws Exception {
+        //媒体映射表没有记录时，用 out_message_ids.media_url 里保存的本域原始地址兜底
+        when(outMessageIdsRepository.findByToMessageIds(eq("B"), anyCollection()))
+            .thenReturn(Collections.singletonList(mapping(100L, "https://a/x.png")));
+        MessagePayload payload = composite(child(900, "https://b/x.png", 1));
+
+        restore("B", payload);
+
+        JsonObject message = childMessage(payload);
+        assertEquals(100L, CompositeMessageUtils.getLong(message, "uid"));
+        assertEquals("https://a/x.png", CompositeMessageUtils.getString(message, "mru"));
+    }
+
+    @Test
+    void restoresChildMediaUrlWhenUidIsAlreadyLocal() throws Exception {
+        //发送方已经用 in_message_ids 把子消息 uid 换成了本域消息ID，此时按 id 查 out_message_ids 取原始地址
+        when(outMessageIdsRepository.findByMessageIds(eq("B"), anyCollection()))
+            .thenReturn(Collections.singletonList(mapping(900L, "https://a/x.png")));
+        MessagePayload payload = composite(child(900, "https://b/x.png", 1));
+
+        restore("B", payload);
+
+        assertEquals("https://a/x.png", CompositeMessageUtils.getString(childMessage(payload), "mru"));
+    }
+
+    @Test
     void restoresChildUid() throws Exception {
         when(outMessageIdsRepository.findByToMessageIds(eq("B"), anyCollection()))
             .thenReturn(Collections.singletonList(mapping(100L)));
@@ -188,10 +214,15 @@ class InServiceCompositeRestoreTest {
     }
 
     private static OutMessageIds mapping(long messageId) {
+        return mapping(messageId, null);
+    }
+
+    private static OutMessageIds mapping(long messageId, String mediaUrl) {
         OutMessageIds ids = new OutMessageIds();
         ids.messageId = messageId;
         ids.toDomainId = "B";
         ids.toMessageId = 900;
+        ids.mediaUrl = mediaUrl;
         return ids;
     }
 }

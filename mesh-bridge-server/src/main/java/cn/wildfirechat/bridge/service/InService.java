@@ -607,8 +607,8 @@ public class InService {
         if(depth > CompositeMessageUtils.MAX_NEST_DEPTH) {
             throw new IllegalArgumentException("composite message nesting is too deep");
         }
-        //整层子消息的 uid 和媒体映射一起预取，避免每个子消息查两次库
-        Map<Long, Long> uidMappings = prefetchCompositeChildUids(domainId, messages);
+        //整层子消息的 uid、原始媒体地址和媒体映射一起预取，避免每个子消息查多次库
+        CompositeChildMappings childMappings = prefetchCompositeChildMappings(domainId, messages);
         prefetchCompositeChildMediaMappings(domainId, messages);
         boolean changed = false;
         for (JsonElement element : messages) {
@@ -618,23 +618,33 @@ public class InService {
             JsonObject message = element.getAsJsonObject();
             //uid 是本域为这条子消息分配的消息ID，publish 回本域时要换回本域的值，否则本域存储的消息会引用对端(或第三方域)的消息ID
             long uid = CompositeMessageUtils.getLong(message, "uid");
+            OutMessageIds childMapping = null;
             if(uid > 0) {
-                Long localUid = uidMappings == null ? null : uidMappings.get(uid);
-                if(uidMappings == null) {
-                    //批量查询失败时退回逐条查询
-                    Optional<OutMessageIds> mapping = outMessageIdsRepository.findByToDomainIdAndToMessageId(domainId, uid);
-                    localUid = mapping.map(outMessageIds -> outMessageIds.messageId).orElse(null);
+                if(childMappings == null) {
+                    //批量查询失败时退回逐条查询：子消息 uid 可能是对端消息ID，也可能已经是本域消息ID
+                    childMapping = outMessageIdsRepository.findByToDomainIdAndToMessageId(domainId, uid).orElse(null);
+                    if(childMapping == null) {
+                        childMapping = outMessageIdsRepository.findByMessageIdAndToDomainId(uid, domainId).orElse(null);
+                    }
+                } else {
+                    childMapping = childMappings.find(uid);
                 }
-                if(localUid != null && localUid > 0 && localUid != uid) {
-                    message.addProperty("uid", localUid);
+                if(childMapping != null && childMapping.messageId > 0 && childMapping.messageId != uid) {
+                    message.addProperty("uid", childMapping.messageId);
                     changed = true;
                 }
             }
             String remoteMediaUrl = CompositeMessageUtils.getString(message, "mru");
             if(StringUtils.hasText(remoteMediaUrl)) {
                 Optional<String> localMediaUrl = mediaUrlMappingService.findLocalMediaUrl(domainId, remoteMediaUrl);
-                if(localMediaUrl.isPresent() && !localMediaUrl.get().equals(remoteMediaUrl)) {
-                    message.addProperty("mru", localMediaUrl.get());
+                String restoredMediaUrl = localMediaUrl.orElse(null);
+                if(!StringUtils.hasText(restoredMediaUrl) && childMapping != null && StringUtils.hasText(childMapping.mediaUrl)) {
+                    //媒体映射表没有记录(未建立或被清理)时，用 out_message_ids 里保存的本域原始地址兜底，
+                    //避免把对端域的文件地址带进本域，也避免重复上传。
+                    restoredMediaUrl = childMapping.mediaUrl;
+                }
+                if(StringUtils.hasText(restoredMediaUrl) && !restoredMediaUrl.equals(remoteMediaUrl)) {
+                    message.addProperty("mru", restoredMediaUrl);
                     changed = true;
                 }
             }
@@ -652,8 +662,10 @@ public class InService {
         return changed;
     }
 
-    //批量查询子消息 uid 在本域对应的消息ID，返回 对端uid -> 本域uid。查询失败返回 null，由调用方退回逐条查询。
-    private Map<Long, Long> prefetchCompositeChildUids(String domainId, JsonArray messages) {
+    //批量查询子消息 uid 在本域对应的消息ID和原始媒体地址。
+    //子消息 uid 可能还是对端消息ID(to_message_id)，也可能已经被发送方换成了本域消息ID(id)，
+    //所以两个方向都查，查询失败返回 null，由调用方退回逐条查询。
+    private CompositeChildMappings prefetchCompositeChildMappings(String domainId, JsonArray messages) {
         Set<Long> uids = new HashSet<>();
         for (JsonElement element : messages) {
             if(!element.isJsonObject()) {
@@ -665,14 +677,19 @@ public class InService {
             }
         }
         if(uids.isEmpty()) {
-            return Collections.emptyMap();
+            return new CompositeChildMappings();
         }
         try {
-            Map<Long, Long> mappings = new HashMap<>();
+            CompositeChildMappings mappings = new CompositeChildMappings();
             for (List<Long> chunk : partitionMessageIds(uids)) {
                 for (OutMessageIds mapping : outMessageIdsRepository.findByToMessageIds(domainId, chunk)) {
                     if(mapping.toMessageId > 0) {
-                        mappings.put(mapping.toMessageId, mapping.messageId);
+                        mappings.byToMessageId.put(mapping.toMessageId, mapping);
+                    }
+                }
+                for (OutMessageIds mapping : outMessageIdsRepository.findByMessageIds(domainId, chunk)) {
+                    if(mapping.messageId > 0) {
+                        mappings.byMessageId.put(mapping.messageId, mapping);
                     }
                 }
             }
@@ -680,6 +697,16 @@ public class InService {
         } catch (Exception e) {
             LOG.warn("batch query composite child message ids failed, fallback to per-message query", e);
             return null;
+        }
+    }
+
+    private static class CompositeChildMappings {
+        final Map<Long, OutMessageIds> byToMessageId = new HashMap<>();
+        final Map<Long, OutMessageIds> byMessageId = new HashMap<>();
+
+        OutMessageIds find(long uid) {
+            OutMessageIds mapping = byToMessageId.get(uid);
+            return mapping != null ? mapping : byMessageId.get(uid);
         }
     }
 

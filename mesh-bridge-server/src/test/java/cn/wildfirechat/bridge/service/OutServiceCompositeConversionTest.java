@@ -312,6 +312,41 @@ class OutServiceCompositeConversionTest {
     }
 
     @Test
+    void doesNotTransferChildMediaWhenChildBelongsToTargetDomainForSendMessage() throws Exception {
+        //1:1 聊天里转发对方发来的图片：子消息来源就是目标域，文件本来就在对方域，不能重新上传
+        MessagePayload payload = composite(image("https://a/x.png", "userA@A", 2000));
+
+        RecordingCallback callback = run("A", payload, false, false);
+
+        assertEquals(1, callback.success.get());
+        assertEquals("https://a/x.png", CompositeMessageUtils.getString(messages(payload).get(0).getAsJsonObject(), "mru"));
+        assertTrue(outService.transferred.isEmpty());
+    }
+
+    @Test
+    void keepsChildMediaUrlWhenNoReverseMappingAndChildBelongsToTargetDomain() throws Exception {
+        //媒体映射缺失时也不能上传，保持原地址，由接收方用 out_message_ids 里的原始地址兜底
+        MessagePayload payload = composite(image("https://b/x.png", "userA@A", 2000));
+
+        RecordingCallback callback = run("A", payload, false, false);
+
+        assertEquals(1, callback.success.get());
+        assertEquals("https://b/x.png", CompositeMessageUtils.getString(messages(payload).get(0).getAsJsonObject(), "mru"));
+        assertTrue(outService.transferred.isEmpty());
+    }
+
+    @Test
+    void stillTransfersChildMediaFromThirdDomainForSendMessage() throws Exception {
+        MessagePayload payload = composite(image("https://a/c.png", "userC@C", 2000));
+
+        RecordingCallback callback = run("A", payload, false, false);
+
+        assertEquals(1, callback.success.get());
+        assertEquals("https://target/c.png", CompositeMessageUtils.getString(messages(payload).get(0).getAsJsonObject(), "mru"));
+        assertEquals(1, outService.transferred.size());
+    }
+
+    @Test
     void reusesSourceDomainUrlFromReverseMappingWhenSendingBack() throws Exception {
         //接收方在收文件时记录了 (domain=A, local=B_url, remote=A_url) 的反向映射，
         //B 再把这个文件发回 A 时应该直接复用 A 的原地址，不再重新上传
