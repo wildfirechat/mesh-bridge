@@ -201,6 +201,63 @@ class OutServiceCompositeConversionTest {
     }
 
     @Test
+    void convertsNestedCompositeChildMedia() throws Exception {
+        JsonObject inner = image("https://a/nested.png", "u1", 400);
+        JsonArray innerMessages = new JsonArray();
+        innerMessages.add(inner);
+        JsonObject innerComposite = new JsonObject();
+        innerComposite.add("ms", innerMessages);
+
+        JsonObject nested = nestedComposite(300, innerComposite);
+        MessagePayload payload = composite(nested);
+
+        RecordingCallback callback = run("B", payload, false, false);
+
+        assertEquals(1, callback.success.get());
+        JsonObject convertedNested = messages(payload).get(0).getAsJsonObject();
+        JsonObject convertedInner = CompositeMessageUtils.messages(
+            CompositeMessageUtils.decode(CompositeMessageUtils.getString(convertedNested, "cbc"))).get(0).getAsJsonObject();
+        assertEquals("https://target/nested.png", CompositeMessageUtils.getString(convertedInner, "mru"));
+        assertEquals(1, outService.transferred.size());
+    }
+
+    @Test
+    void convertsNestedCompositeChildUid() throws Exception {
+        OutMessageIds mapping = new OutMessageIds();
+        mapping.messageId = 100;
+        mapping.toDomainId = "B";
+        mapping.toMessageId = 400;
+        when(outService.outMessageIdsRepository.findByMessageIds(eq("B"), anyCollection()))
+            .thenReturn(Collections.singletonList(mapping));
+
+        JsonObject inner = text("inner", "u1", 100);
+        JsonArray innerMessages = new JsonArray();
+        innerMessages.add(inner);
+        JsonObject innerComposite = new JsonObject();
+        innerComposite.add("ms", innerMessages);
+
+        MessagePayload payload = composite(nestedComposite(300, innerComposite));
+
+        RecordingCallback callback = run("B", payload, false, false);
+
+        assertEquals(1, callback.success.get());
+        JsonObject convertedNested = messages(payload).get(0).getAsJsonObject();
+        JsonObject convertedInner = CompositeMessageUtils.messages(
+            CompositeMessageUtils.decode(CompositeMessageUtils.getString(convertedNested, "cbc"))).get(0).getAsJsonObject();
+        assertEquals(400L, CompositeMessageUtils.getLong(convertedInner, "uid"));
+    }
+
+    @Test
+    void rejectsTooDeeplyNestedComposite() throws Exception {
+        MessagePayload payload = deeplyNestedComposite(40);
+
+        RecordingCallback callback = run("B", payload, false, false);
+
+        assertEquals(0, callback.success.get());
+        assertEquals(1, callback.failures.get());
+    }
+
+    @Test
     void waitsForAsyncMediaBeforeConvertingNextChild() throws Exception {
         outService.delayMs = 30;
         MessagePayload payload = composite(
@@ -371,6 +428,29 @@ class OutServiceCompositeConversionTest {
         message.addProperty("csc", content);
         message.addProperty("cc", content);
         return message;
+    }
+
+    private static MessagePayload deeplyNestedComposite(int levels) {
+        JsonObject inner = text("deep", "u1", 1);
+        for (int i = 0; i < levels; i++) {
+            JsonArray messages = new JsonArray();
+            messages.add(inner);
+            JsonObject innerComposite = new JsonObject();
+            innerComposite.add("ms", messages);
+            inner = nestedComposite(100 + i, innerComposite);
+        }
+        return composite(inner);
+    }
+
+    private static JsonObject nestedComposite(long uid, JsonObject innerComposite) {
+        JsonObject nested = new JsonObject();
+        nested.addProperty("uid", uid);
+        nested.addProperty("ctype", 11);
+        nested.addProperty("from", "u1");
+        nested.addProperty("target", "g1");
+        nested.addProperty("mt", 4);
+        nested.addProperty("cbc", CompositeMessageUtils.encode(innerComposite));
+        return nested;
     }
 
     private static JsonObject image(String mru, String from, long uid) {

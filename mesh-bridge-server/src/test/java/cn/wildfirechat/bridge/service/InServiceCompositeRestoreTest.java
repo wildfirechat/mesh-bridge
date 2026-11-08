@@ -127,6 +127,42 @@ class InServiceCompositeRestoreTest {
     }
 
     @Test
+    void restoresNestedChildUid() throws Exception {
+        when(outMessageIdsRepository.findByToMessageIds(eq("B"), anyCollection()))
+            .thenReturn(Collections.singletonList(mapping(100L)));
+        MessagePayload payload = composite(nested(2, child(900, null, 1)));
+
+        restore("B", payload);
+
+        JsonObject inner = CompositeMessageUtils.messages(
+            CompositeMessageUtils.decode(CompositeMessageUtils.getString(childMessage(payload), "cbc"))).get(0).getAsJsonObject();
+        assertEquals(100L, CompositeMessageUtils.getLong(inner, "uid"));
+    }
+
+    @Test
+    void restoresNestedChildMediaUrlFromOutMessageMapping() throws Exception {
+        when(outMessageIdsRepository.findByMessageIds(eq("B"), anyCollection()))
+            .thenReturn(Collections.singletonList(mapping(100L, "https://a/x.png")));
+        MessagePayload payload = composite(nested(2, child(100, "https://b/x.png", 1)));
+
+        restore("B", payload);
+
+        JsonObject inner = CompositeMessageUtils.messages(
+            CompositeMessageUtils.decode(CompositeMessageUtils.getString(childMessage(payload), "cbc"))).get(0).getAsJsonObject();
+        assertEquals("https://a/x.png", CompositeMessageUtils.getString(inner, "mru"));
+    }
+
+    @Test
+    void keepsPayloadUnchangedWhenNestedTooDeep() throws Exception {
+        MessagePayload payload = deeplyNestedComposite(40);
+        String original = payload.getBase64edData();
+
+        restore("B", payload);
+
+        assertEquals(original, payload.getBase64edData());
+    }
+
+    @Test
     void keepsPayloadUnchangedWhenNothingMatched() throws Exception {
         MessagePayload payload = composite(child(900, "https://b/x.png", 1));
         String original = payload.getBase64edData();
@@ -198,6 +234,39 @@ class InServiceCompositeRestoreTest {
         payload.setType(11);
         payload.setBase64edData(CompositeMessageUtils.encode(composite));
         return payload;
+    }
+
+    private static MessagePayload deeplyNestedComposite(int levels) {
+        JsonObject inner = child(1, null, 1);
+        for (int i = 0; i < levels; i++) {
+            JsonArray messages = new JsonArray();
+            messages.add(inner);
+            JsonObject innerComposite = new JsonObject();
+            innerComposite.add("ms", messages);
+            JsonObject nested = new JsonObject();
+            nested.addProperty("uid", 100 + i);
+            nested.addProperty("ctype", 11);
+            nested.addProperty("from", "u1");
+            nested.addProperty("cbc", CompositeMessageUtils.encode(innerComposite));
+            inner = nested;
+        }
+        return composite(inner);
+    }
+
+    private static JsonObject nested(long uid, JsonObject... innerChildren) {
+        JsonArray innerMessages = new JsonArray();
+        for (JsonObject innerChild : innerChildren) {
+            innerMessages.add(innerChild);
+        }
+        JsonObject innerComposite = new JsonObject();
+        innerComposite.add("ms", innerMessages);
+
+        JsonObject nested = new JsonObject();
+        nested.addProperty("uid", uid);
+        nested.addProperty("ctype", 11);
+        nested.addProperty("from", "u1");
+        nested.addProperty("cbc", CompositeMessageUtils.encode(innerComposite));
+        return nested;
     }
 
     private static JsonObject child(long uid, String remoteMediaUrl, int ctype) {
